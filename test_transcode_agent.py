@@ -3,6 +3,7 @@
     python3 -m unittest discover -s . -p 'test_*.py'
 """
 import http.client
+import json
 import os
 import sys
 import tempfile
@@ -87,7 +88,8 @@ class FakeApi:
         self.calls.append((method, path.rsplit("/", 1)[-1], data))
         return 204, {}, b""
 
-    def call(self, *args, **kwargs):
+    def call(self, method, path, body=None, **kwargs):
+        self.called = getattr(self, "called", []) + [(method, path, body)]
         return None
 
     def close(self):
@@ -358,9 +360,9 @@ class RcloneSourceTests(unittest.TestCase):
         os.environ.pop("FAKE_RCLONE_ROOT", None)
         self.tmp.cleanup()
 
-    def job(self, path):
+    def job(self, path, **more):
         source = agent.clean_source(
-            {"kind": "rclone", "remote": "gds", "folder_id": "1AbC_dEf-9", "path": path}, "server", ["gds"])
+            {"kind": "rclone", "remote": "gds", "folder_id": "1AbC_dEf-9", "path": path, **more}, "server", ["gds"])
         job = SimpleNamespace(id=JOB_ID, nonce="n" * 32, stopped=threading.Event(), source=source)
         self.proxy.jobs[JOB_ID] = job
         return job
@@ -385,6 +387,31 @@ class RcloneSourceTests(unittest.TestCase):
         self.assertEqual(self.fetch(job)[0], 404)
         self.assertEqual(len((self.root / "starts.log").read_text().splitlines()), 2)
 
+    def test_a_remote_that_cannot_see_the_file_reads_through_the_server(self):
+        """Same remote name, different contents (or the wrong rclone build): playback must not
+        fail when the server can hand the file over."""
+        server = Upstream(b"server-bytes")
+        server.token = "runner"
+        try:
+            job = self.job("영화/not on this remote.mkv", server_fallback=True)
+            job.api = SimpleNamespace(base_url=server.url.rsplit("/", 1)[0], token="runner")
+            self.assertEqual(self.fetch(job), (200, b"server-bytes"))
+            self.assertEqual(job.source, {"kind": "server"})
+            # The next job on that remote skips rclone for a while instead of failing again first.
+            starts = len((self.root / "starts.log").read_text().splitlines())
+            later = self.job("영화/인터스텔라 (2014)/Interstellar [x265].mkv", server_fallback=True)
+            later.api = job.api
+            self.assertEqual(self.fetch(later), (200, b"server-bytes"))
+            self.assertEqual(len((self.root / "starts.log").read_text().splitlines()), starts)
+            # Meanwhile the remote is not advertised, so servers stop sending rclone sources.
+            self.assertEqual(self.servers.unreadable_remotes(), {"gds"})
+            # Without the server's offer the miss stays a miss.
+            self.servers._unreadable.clear()
+            self.assertEqual(self.servers.unreadable_remotes(), set())
+            self.assertEqual(self.fetch(self.job("영화/not on this remote.mkv"))[0], 404)
+        finally:
+            server.server.shutdown()
+
     def test_only_remotes_the_owner_allowed_and_only_plain_paths(self):
         ok = {"kind": "rclone", "remote": "gds", "folder_id": "1AbC", "path": "a/b.mkv"}
         for change in ({"remote": "other"}, {"remote": "115_sftp"}, {"folder_id": "x} --config /etc"},
@@ -393,6 +420,22 @@ class RcloneSourceTests(unittest.TestCase):
                 agent.clean_source({**ok, **change}, "server", ["gds"])
         with self.assertRaises(agent.AgentError):
             agent.clean_source(ok, "server", [])            # a runner without rclone remotes
+
+    def test_rclone_is_found_when_the_service_has_a_short_path(self):
+        """launchd and systemd start the agent without /usr/local/bin on PATH."""
+        saved = os.environ["PATH"], agent.RCLONE_SEARCH_DIRS
+        os.environ["PATH"], agent.RCLONE_SEARCH_DIRS = "/nonexistent", ("/nowhere", str(self.root))
+        try:
+            self.assertEqual(agent.find_rclone(), str(self.binary))
+            self.assertEqual(agent.find_rclone("rclone"), str(self.binary))
+            self.assertIsNone(agent.find_rclone("rclone-missing"))
+            self.assertIsNone(agent.find_rclone(str(self.root / "elsewhere" / "rclone")))
+            config = SimpleNamespace(data={})
+            agent.apply_rclone_options(config, SimpleNamespace(rclone=None, rclone_config=None, rclone_remote=["gds"]))
+            self.assertEqual(config.data["rclone"], str(self.binary))      # kept as a full path
+            self.assertEqual(agent.usable_rclone_remotes(config.data), ["gds"])
+        finally:
+            os.environ["PATH"], agent.RCLONE_SEARCH_DIRS = saved
 
     def test_install_checks_the_remote_exists_in_the_runners_config(self):
         config = SimpleNamespace(data={"rclone": str(self.binary)})
@@ -405,6 +448,204 @@ class RcloneSourceTests(unittest.TestCase):
                 agent.apply_rclone_options(config, SimpleNamespace(rclone=None, rclone_config=None, rclone_remote=bad))
         agent.apply_rclone_options(config, SimpleNamespace(rclone=None, rclone_config=None, rclone_remote=[]))
         self.assertEqual(config.data["rclone_remotes"], [])
+
+
+CAPS = {"video_encoder": "h264_videotoolbox", "hw_encoder": "h264_videotoolbox", "tonemap": True,
+        "ffmpeg_version": "8.1"}
+
+
+class FakeJob:
+    def __init__(self, owner, command, link=None):
+        if not agent._JOB_ID_RE.fullmatch(str(command.get("id") or "")):
+            raise agent.AgentError("bad job id")
+        self.id, self.link, self.stops = command["id"], link, 0
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self.stops += 1
+
+
+def job_id(number):
+    return "%032x" % number
+
+
+def start(number):
+    return {"type": "start", "job": {"id": job_id(number)}}
+
+
+class SharedSlotTests(unittest.TestCase):
+    """One agent attached to several servers: the device counts its slots, the servers do not
+    divide them up."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        config = agent.Config(Path(self.tmp.name))
+        config.data.update({"ffmpeg": "/opt/ffmpeg", "slots": 2, "servers": [
+            {"url": "https://one.example", "token": "a", "runner_id": 1, "name": "box"},
+            {"url": "https://two.example", "token": "b", "runner_id": 7, "name": "box"},
+        ]})
+        self.saved = agent.detect_capabilities, agent.machine_info, agent.Job
+        agent.detect_capabilities = lambda ffmpeg, preference="auto": dict(CAPS)
+        agent.machine_info = lambda: {"os": "test"}
+        agent.Job = FakeJob
+        self.agent = agent.Agent(config)
+        self.one, self.two = self.agent.links
+        for link in self.agent.links:
+            link.api = FakeApi()
+            link.api.called = []
+
+    def tearDown(self):
+        self.agent.running = False
+        agent.detect_capabilities, agent.machine_info, agent.Job = self.saved
+        self.agent.proxy.server.shutdown()
+        self.tmp.cleanup()
+
+    def wait_for(self, check):
+        deadline = agent.time.monotonic() + 5
+        while not check() and agent.time.monotonic() < deadline:
+            threading.Event().wait(0.01)
+        self.assertTrue(check())
+
+    def test_the_last_slot_goes_to_whichever_server_asks_first(self):
+        self.agent.handle(self.one, start(1))
+        self.agent.handle(self.two, start(2))
+        self.agent.handle(self.one, start(3))                    # the device is full
+        self.assertEqual(sorted(self.agent.jobs), [job_id(1), job_id(2)])
+        # The refused server hears at once, so it can hand the job to another worker.
+        refused = [call for call in self.one.api.called if call[1].endswith("/state")]
+        self.assertEqual([(path, body["state"]) for _, path, body in refused],
+                         [("/transcode-agent/jobs/%s/state" % job_id(3), "failed")])
+        self.agent.job_finished(self.agent.jobs[job_id(2)])
+        self.agent.handle(self.one, start(4))                    # a freed slot is anyone's
+        self.assertEqual(sorted(self.agent.jobs), [job_id(1), job_id(4)])
+
+    def test_each_server_is_told_what_the_others_are_using(self):
+        self.agent.handle(self.one, start(1))
+        mine, theirs = self.agent.report(self.one), self.agent.report(self.two)
+        self.assertEqual((mine["jobs"], mine["busy_elsewhere"]), ([job_id(1)], 0))
+        self.assertEqual((theirs["jobs"], theirs["busy_elsewhere"]), ([], 1))
+        self.assertEqual((mine["recommended_slots"], theirs["recommended_slots"]), (2, 2))
+        self.agent.job_finished(self.agent.jobs[job_id(1)])
+        self.assertEqual(self.agent.report(self.two)["busy_elsewhere"], 0)
+
+    def test_other_servers_hear_of_a_change_without_waiting_for_their_poll(self):
+        self.agent.handle(self.one, start(1))
+        self.wait_for(lambda: self.two.api.called)
+        method, path, body = self.two.api.called[-1]
+        self.assertEqual((path, body["wait"], body["busy_elsewhere"]), ("/transcode-agent/poll", 0, 1))
+        self.assertEqual(self.one.api.called, [])                # the server that gave the job already knows
+        self.agent.job_finished(self.agent.jobs[job_id(1)])
+        self.wait_for(lambda: len(self.two.api.called) == 2)
+        self.assertEqual(self.two.api.called[-1][2]["busy_elsewhere"], 0)
+
+    def test_a_server_only_controls_its_own_jobs(self):
+        self.agent.handle(self.one, start(1))
+        job = self.agent.jobs[job_id(1)]
+        self.agent.handle(self.two, {"type": "stop", "job_id": job_id(1)})
+        self.assertEqual(job.stops, 0)
+        self.agent.handle(self.one, {"type": "stop", "job_id": job_id(1)})
+        self.assertEqual(job.stops, 1)
+
+    def test_a_server_that_went_away_gives_its_slots_back(self):
+        """A paused job uploads nothing, so it would never notice its server is gone."""
+        class Down(FakeApi):
+            def call(self, *args, **kwargs):
+                raise agent.AgentError("server unreachable")
+
+        self.agent.handle(self.one, start(1))
+        self.agent.handle(self.two, start(2))
+        mine, theirs = self.agent.jobs[job_id(1)], self.agent.jobs[job_id(2)]
+        self.two.api = Down()
+        self.agent._sleep = lambda seconds: setattr(self.agent, "running", False)
+        self.agent._serve(self.two)                              # a short outage: nothing is touched
+        self.assertEqual((mine.stops, theirs.stops), (0, 0))
+        self.two.last_ok = agent.time.monotonic() - agent.SERVER_LOST_SEC - 1
+        self.agent.running = True
+        self.agent._serve(self.two)
+        self.assertEqual((mine.stops, theirs.stops), (0, 1))
+
+    def test_a_job_talks_to_the_server_that_gave_it(self):
+        agent.Job = self.saved[2]
+        job = agent.Job(self.agent, {"id": job_id(9), "kind": "hls", "spec": {"mode": "video"},
+                                     "source": {"kind": "server"}}, self.two)
+        self.assertIs(job.api, self.two.api)
+        self.two.api.base_url, self.two.api.token = "https://two.example", "b"
+        url, headers = self.agent.proxy._upstream(job, "media")
+        self.assertEqual((url, headers["Authorization"]),
+                         ("https://two.example/transcode-agent/jobs/%s/source" % job_id(9), "Bearer b"))
+
+
+class RegisterApi:
+    registered = []
+
+    def __init__(self, base_url, token):
+        self.base_url, self.token = base_url.rstrip("/"), token
+
+    def call(self, method, path, body=None, **kwargs):
+        RegisterApi.registered.append((self.base_url, body["recommended_slots"]))
+        number = len(RegisterApi.registered)
+        return {"runner_id": number, "token": "credential-%d" % number, "name": body["name"]}
+
+
+class ServerListTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.saved = agent.Api, agent.choose_ffmpeg, agent.machine_info, agent._restart_service
+        agent.Api, RegisterApi.registered = RegisterApi, []
+        agent.choose_ffmpeg = lambda config, explicit: ("/opt/ffmpeg", dict(CAPS))
+        agent.machine_info = lambda: {"os": "test"}
+        agent._restart_service = lambda: None
+        self.stdout, self.stderr = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = open(os.devnull, "w")
+
+    def tearDown(self):
+        sys.stdout.close()
+        sys.stdout, sys.stderr = self.stdout, self.stderr
+        agent.Api, agent.choose_ffmpeg, agent.machine_info, agent._restart_service = self.saved
+        self.tmp.cleanup()
+
+    def run_agent(self, *arguments):
+        return agent.main([arguments[0], "--dir", str(self.home), *arguments[1:]])
+
+    def servers(self):
+        return [(entry["url"], entry["token"]) for entry in agent.Config(self.home).servers]
+
+    def test_the_same_command_on_another_server_adds_it(self):
+        install = ("install", "--token", "shr_once", "--no-service", "--name", "box")
+        self.assertEqual(self.run_agent(*install, "--url", "https://one.example/", "--slots", "3"), 0)
+        self.assertEqual(self.run_agent(*install, "--url", "https://two.example"), 0)
+        self.assertEqual(self.servers(), [("https://one.example", "credential-1"),
+                                          ("https://two.example", "credential-2")])
+        # Both servers are told the device total, not a share of it.
+        self.assertEqual(RegisterApi.registered, [("https://one.example", 3), ("https://two.example", 3)])
+        self.assertEqual(self.run_agent(*install, "--url", "https://one.example"), 1)     # already there
+        self.assertEqual(self.run_agent(*install, "--url", "https://one.example", "--force"), 0)
+        self.assertEqual(self.servers(), [("https://one.example", "credential-3"),
+                                          ("https://two.example", "credential-2")])
+
+    def test_one_server_can_be_removed_but_not_the_last(self):
+        install = ("install", "--token", "shr_once", "--no-service")
+        self.run_agent(*install, "--url", "https://one.example")
+        self.run_agent(*install, "--url", "https://two.example")
+        self.assertEqual(self.run_agent("remove-server", "--url", "https://three.example"), 1)
+        self.assertEqual(self.run_agent("remove-server", "--url", "https://one.example/"), 0)
+        self.assertEqual(self.servers(), [("https://two.example", "credential-2")])
+        self.assertEqual(self.run_agent("remove-server", "--url", "https://two.example"), 1)
+        self.assertEqual(len(self.servers()), 1)
+
+    def test_a_single_server_config_from_0_2_still_loads(self):
+        (self.home / "config.json").write_text(json.dumps({
+            "server_url": "https://one.example", "token": "old", "runner_id": 4, "name": "box",
+            "ffmpeg": "/opt/ffmpeg", "tmp_dir": "/work",
+        }))
+        config = agent.Config(self.home)
+        self.assertEqual(config.servers, [
+            {"url": "https://one.example", "token": "old", "runner_id": 4, "name": "box"}])
+        self.assertEqual((config.data["ffmpeg"], str(config.tmp_dir)), ("/opt/ffmpeg", "/work"))
+        self.assertNotIn("token", config.data)
 
 
 if __name__ == "__main__":

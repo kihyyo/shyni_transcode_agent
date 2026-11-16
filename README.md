@@ -18,6 +18,8 @@ H/W 가 있는 다른 기기에 맡기는 에이전트입니다.
   쓰므로 앱을 바꿀 필요가 없고, 재생 세션과 이어보기도 그대로 서버가 관리합니다.
 - 서버 한 대에 여러 러너를 붙일 수 있습니다. 서버는 응답 가능한 작업자 가운데 H/W 가 되는
   쪽, 그중 빈 슬롯이 많은 쪽에 일을 줍니다.
+- 러너 하나를 여러 서버에 붙일 수도 있습니다(아래 "여러 서버에서 같이 쓰기"). 동시 작업 수는
+  이 기기가 셉니다 — 서버들이 슬롯을 미리 나눠 갖지 않고, 필요한 서버가 그때그때 씁니다.
 
 ## 필요한 것
 
@@ -69,11 +71,23 @@ location /transcode-agent/ {
    python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py configure --rclone-remote gds
    ```
 
-   rclone 이 PATH 에 없거나 설정 파일이 기본 위치가 아니면 `--rclone <경로>`,
-   `--rclone-config <경로>` 를 함께 줍니다. 리모트가 여러 개면 `--rclone-remote` 를 반복합니다.
+   rclone 은 PATH 와 흔한 설치 위치(`/usr/local/bin`, `/opt/homebrew/bin` 등)에서 찾아 전체
+   경로로 저장합니다(서비스는 PATH 가 짧습니다). 다른 곳에 있거나 설정 파일이 기본 위치가 아니면
+   `--rclone <경로>`, `--rclone-config <경로>` 를 함께 줍니다. 리모트가 여러 개면
+   `--rclone-remote` 를 반복합니다.
 
 에이전트는 허용한 리모트만 서버에 알리고, 그 리모트의 경로만 읽습니다. 작업이 오면 127.0.0.1 에
 `rclone serve http` 를 띄워(접속 암호는 그때그때 만듦) ffmpeg 가 그 뒤에서 읽게 합니다.
+
+이 기기의 rclone 이 그 파일을 읽지 못하면(이름만 같고 내용이 다른 리모트, GDS 인데 wiserain
+빌드가 아닌 rclone 등) 재생이 실패하지 않고 서버가 내주는 원본으로 바꿔 읽습니다. 로그에
+`rclone 리모트 '…' 로 원본을 읽지 못해 서버에서 받습니다` 가 남고, 그 리모트는 한 시간 동안
+서버에 알리지 않습니다(관리자 화면에 "rclone 없음"으로 보입니다). 고친 뒤에는 에이전트를 다시
+시작하면 바로 다시 씁니다. 확인은 이 기기에서:
+
+```sh
+rclone lsf "gds:{서버 마운트 관리의 루트 폴더 ID}" --max-depth 1
+```
 
 ## 설치
 
@@ -103,21 +117,46 @@ curl -fsSL https://raw.githubusercontent.com/kihyyo/shyni_transcode_agent/main/i
 | `--dir` | 에이전트 폴더 (기본 `~/shyni-transcoder`) |
 | `--tmp` | 변환 임시 폴더 (기본 `<폴더>/tmp`). 여유 공간이 넉넉한 디스크를 지정 |
 | `--name` | 관리자 화면에 보일 러너 이름 (기본 호스트 이름) |
-| `--slots` | 이 기기가 받을 동시 작업 상한. 서버가 그보다 많이 주지 않습니다 |
+| `--slots` | 이 기기의 총 동시 작업 수 (기본 추천값). 붙어 있는 서버를 모두 합친 한도입니다 |
 | `--encoder` | `auto`(기본) · `software` · `nvenc` · `vaapi` · `qsv` · `videotoolbox` |
 | `--ffmpeg` | 쓸 ffmpeg 경로를 직접 지정 (자동 선택·내려받기 생략) |
 | `--rclone-remote` | 이 기기의 rclone 으로 직접 읽을 리모트 이름 (위 "rclone 으로 원본 직접 읽기") |
 | `--rclone`, `--rclone-config` | rclone 실행 파일과 설정 파일 위치 (기본값이 아닐 때) |
 | `--no-service` | 서비스로 등록하지 않음. 직접 `run` 으로 실행 |
-| `--force` | 이미 등록된 폴더에 다시 등록 |
+| `--force` | 이미 등록한 서버에 다시 등록 |
 
 임시 폴더에는 아직 서버로 올리지 않은 조각만 남으므로 보통 수백 MB 안쪽입니다.
 
-### 추천 슬롯
+### 슬롯
 
-등록할 때 동시 변환 추천 수를 서버에 알립니다. H/W 인코더가 있으면 고성능 코어 수 + 2
-(Apple M1 = 6), S/W 면 물리 코어 2개당 1개(최대 4)입니다. 관리자 화면에서 러너마다
-"최대 슬롯"을 바꿀 수 있고, 비워 두면 추천값을 씁니다.
+이 기기가 동시에 돌릴 변환 수(총 슬롯)는 이 기기가 정합니다. 기본은 추천값으로, H/W 인코더가
+있으면 고성능 코어 수 + 2(Apple M1 = 6), S/W 면 물리 코어 2개당 1개(최대 4)입니다. 바꾸려면
+이 기기에서 실행합니다.
+
+```sh
+python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py configure --slots 8   # 0 이면 추천값으로
+```
+
+관리자 화면의 러너별 "최대 슬롯"은 그 서버가 이 기기에서 쓸 몫을 총 슬롯 안에서 줄이는
+값입니다. 비워 두면 총 슬롯까지 씁니다.
+
+### 여러 서버에서 같이 쓰기
+
+서버마다 관리자 화면에서 설치 명령을 만들어 이 기기에서 한 번씩 실행하면 됩니다. 이미 등록된
+폴더(`--dir`)에 다른 서버의 명령을 실행하면 그 서버가 **추가**됩니다(ffmpeg·임시 폴더·rclone
+설정은 그대로).
+
+- 에이전트 하나가 모든 서버에 붙어 있고, 총 슬롯은 서버들이 같이 씁니다. 총 6개면 한 서버가
+  6개를 다 쓸 수도, 세 서버가 2개씩 쓸 수도 있습니다.
+- 에이전트는 각 서버에 "다른 서버가 지금 몇 개 쓰는지"를 알리고, 작업 수가 바뀌면 바로 다시
+  알립니다. 서버끼리는 아무것도 주고받지 않습니다.
+- 두 서버가 마지막 슬롯을 동시에 주면 늦은 쪽을 거절하고, 그 서버는 다른 작업자에게 맡깁니다.
+
+서버 하나만 빼려면:
+
+```sh
+python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py remove-server --url https://shyni.example
+```
 
 ### 플랫폼별 H/W
 
@@ -133,7 +172,7 @@ GPU 드라이버는 설치하지 않습니다(관리자 권한과 커널에 맞�
 ## 쓰기
 
 ```sh
-python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py status      # 인코더·설정 확인
+python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py status      # 붙은 서버·인코더·설정 확인
 python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py run         # 직접 실행(--no-service 일 때)
 python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py update      # 새 버전 받기
 python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py uninstall   # 서비스·등록 정보 제거
@@ -190,6 +229,8 @@ python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py uninstall   # 서비�
 - **변환 재생이 실패하고 로그에 413** — 위 [리버스 프록시](#리버스-프록시)를 보세요.
 - **H/W 가 아니라 S/W 로 등록됨** — `status` 로 다시 확인하고, 위 표의 준비 사항을 보세요.
   로그에 "인코더 시험 실패"와 ffmpeg 의 오류가 남습니다.
+- **rclone 리모트를 넣었는데 관리자 화면에 "rclone 없음"** — 이 기기의 rclone 이 그 원본을 읽지
+  못해 서버 중계로 넘어간 것입니다. 위 "rclone 으로 원본 직접 읽기"의 확인 명령을 실행해 보세요.
 - **macOS 에서 외장 디스크(`/Volumes/…`)를 폴더로 쓸 때** — launchd 서비스로 도는 프로그램은
   외장 디스크에 접근할 수 없고, 묻는 창도 뜨지 않습니다. 관리자 화면에는 "오프라인"으로만
   보입니다. 시스템 설정 → 개인정보 보호 및 보안 → **전체 디스크 접근 권한**에 설치가 알려 주는

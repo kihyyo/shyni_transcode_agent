@@ -3,6 +3,8 @@
     python3 -m unittest discover -s . -p 'test_*.py'
 """
 import http.client
+import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -192,6 +194,7 @@ class Upstream:
         self.data = data
         self.token = "old"
         self.seen = []
+        self.agents = []
         self.drop_after = None
 
         class Handler(BaseHTTPRequestHandler):
@@ -200,6 +203,7 @@ class Upstream:
 
             def do_GET(self):
                 upstream.seen.append((self.headers.get("Authorization"), self.headers.get("Range")))
+                upstream.agents.append(self.headers.get_all("User-Agent"))
                 if self.headers.get("Authorization") != "Bearer " + upstream.token:
                     self.send_response(401)
                     self.send_header("Content-Length", "0")
@@ -268,6 +272,26 @@ class SourceProxyTests(unittest.TestCase):
         self.assertEqual(headers["Content-Range"], "bytes 1000-1999/%d" % len(self.upstream.data))
         self.assertEqual(self.upstream.seen, [("Bearer old", "bytes=1000-1999")])
 
+    def test_every_response_announces_that_the_connection_closes(self):
+        """FFmpeg reuses a connection for its next seek unless told it will close; when the
+        proxy closed silently, FFmpeg lost the index at the end of the file and read from byte 0."""
+        _, headers, _ = self.fetch(self.proxy.url_for(self.job, "media"), {"Range": "bytes=0-99"})
+        self.assertEqual(headers["Connection"], "close")
+        status, headers, _ = self.fetch("/%s/%s/media" % (JOB_ID, "x" * 32))
+        self.assertEqual((status, headers["Connection"]), (404, "close"))
+        self.upstream.token = "gone"
+        self.job.refresh_source = lambda: None
+        status, headers, _ = self.fetch(self.proxy.url_for(self.job, "media"))
+        self.assertEqual((status, headers["Connection"]), (401, "close"))
+
+    def test_source_user_agent_replaces_the_agents_own(self):
+        """A 115 signed URL only opens with the User-Agent it was issued for."""
+        self.fetch(self.proxy.url_for(self.job, "media"), {"Range": "bytes=0-9"})
+        self.assertEqual(self.upstream.agents[-1], [agent.USER_AGENT])
+        self.job.source["headers"]["user-agent"] = "Mozilla/5.0 issued-for-this-url"
+        self.fetch(self.proxy.url_for(self.job, "media"), {"Range": "bytes=0-9"})
+        self.assertEqual(self.upstream.agents[-1], ["Mozilla/5.0 issued-for-this-url"])
+
     def test_only_the_job_nonce_opens_the_proxy(self):
         self.assertEqual(self.fetch("/%s/%s/media" % (JOB_ID, "x" * 32))[0], 404)
         self.assertEqual(self.fetch("/%s/%s/config.json" % (JOB_ID, self.job.nonce))[0], 404)
@@ -286,6 +310,101 @@ class SourceProxyTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, self.upstream.data)
         self.assertEqual(self.upstream.seen[1][1], "bytes=300000-")
+
+
+FAKE_RCLONE = '''#!%s
+"""Stands in for rclone: `listremotes`, and `serve http <remote>:{id} --addr host:port`."""
+import base64, http.server, os, sys, urllib.parse
+if sys.argv[1] == "listremotes":
+    print("gds:"); print("other:"); sys.exit(0)
+assert sys.argv[1:3] == ["serve", "http"], sys.argv
+target = sys.argv[3]
+host, port = sys.argv[sys.argv.index("--addr") + 1].split(":")
+root = os.environ["FAKE_RCLONE_ROOT"]
+open(os.path.join(root, "starts.log"), "a").write(target + "\\n")
+expected = "Basic " + base64.b64encode(("%%s:%%s" %% (os.environ["RCLONE_USER"], os.environ["RCLONE_PASS"])).encode()).decode()
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def do_GET(self):
+        path = os.path.join(root, "files", urllib.parse.unquote(self.path).lstrip("/"))
+        if self.headers.get("Authorization") != expected:
+            self.send_response(401); self.send_header("Content-Length", "0"); self.end_headers(); return
+        if not os.path.isfile(path):
+            self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
+        data = open(path, "rb").read()
+        self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
+        self.wfile.write(data)
+http.server.HTTPServer((host, int(port)), Handler).serve_forever()
+''' % sys.executable
+
+
+class RcloneSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.binary = root / "rclone"
+        self.binary.write_text(FAKE_RCLONE)
+        self.binary.chmod(0o755)
+        (root / "files" / "영화" / "인터스텔라 (2014)").mkdir(parents=True)
+        (root / "files" / "영화" / "인터스텔라 (2014)" / "Interstellar [x265].mkv").write_bytes(b"gds-bytes")
+        os.environ["FAKE_RCLONE_ROOT"] = str(root)
+        self.servers = agent.RcloneServers(str(self.binary), None, root / "logs")
+        self.proxy = agent.SourceProxy(SimpleNamespace(base_url="http://127.0.0.1:1", token="runner"), self.servers)
+        self.root = root
+
+    def tearDown(self):
+        self.servers.close()
+        self.proxy.server.shutdown()
+        os.environ.pop("FAKE_RCLONE_ROOT", None)
+        self.tmp.cleanup()
+
+    def job(self, path):
+        source = agent.clean_source(
+            {"kind": "rclone", "remote": "gds", "folder_id": "1AbC_dEf-9", "path": path}, "server", ["gds"])
+        job = SimpleNamespace(id=JOB_ID, nonce="n" * 32, stopped=threading.Event(), source=source)
+        self.proxy.jobs[JOB_ID] = job
+        return job
+
+    def fetch(self, job):
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.port, timeout=40)
+        conn.request("GET", "/%s/%s/media" % (job.id, job.nonce))
+        response = conn.getresponse()
+        body = response.read()
+        conn.close()
+        return response.status, body
+
+    def test_reads_the_same_path_through_the_runners_own_rclone(self):
+        job = self.job("영화/인터스텔라 (2014)/Interstellar [x265].mkv")
+        self.assertEqual(self.fetch(job), (200, b"gds-bytes"))
+        self.assertEqual(self.fetch(job), (200, b"gds-bytes"))
+        # One rclone per remote and root folder, kept running between jobs.
+        self.assertEqual((self.root / "starts.log").read_text().splitlines(), ["gds:{1AbC_dEf-9}"])
+
+    def test_a_missing_file_gets_one_fresh_listing(self):
+        job = self.job("영화/new episode.mkv")
+        self.assertEqual(self.fetch(job)[0], 404)
+        self.assertEqual(len((self.root / "starts.log").read_text().splitlines()), 2)
+
+    def test_only_remotes_the_owner_allowed_and_only_plain_paths(self):
+        ok = {"kind": "rclone", "remote": "gds", "folder_id": "1AbC", "path": "a/b.mkv"}
+        for change in ({"remote": "other"}, {"remote": "115_sftp"}, {"folder_id": "x} --config /etc"},
+                       {"path": "../secret"}, {"path": "/abs"}, {"path": "a//b"}, {"path": "a/./b"}, {"path": ""}):
+            with self.assertRaises(agent.AgentError, msg=change):
+                agent.clean_source({**ok, **change}, "server", ["gds"])
+        with self.assertRaises(agent.AgentError):
+            agent.clean_source(ok, "server", [])            # a runner without rclone remotes
+
+    def test_install_checks_the_remote_exists_in_the_runners_config(self):
+        config = SimpleNamespace(data={"rclone": str(self.binary)})
+        args = SimpleNamespace(rclone=None, rclone_config=None, rclone_remote=["gds"])
+        agent.apply_rclone_options(config, args)
+        self.assertEqual(config.data["rclone_remotes"], ["gds"])
+        self.assertEqual(agent.usable_rclone_remotes(config.data), ["gds"])
+        for bad in (["nope"], ["-flag"], ["gds", "missing"]):
+            with self.assertRaises(agent.AgentError):
+                agent.apply_rclone_options(config, SimpleNamespace(rclone=None, rclone_config=None, rclone_remote=bad))
+        agent.apply_rclone_options(config, SimpleNamespace(rclone=None, rclone_config=None, rclone_remote=[]))
+        self.assertEqual(config.data["rclone_remotes"], [])
 
 
 if __name__ == "__main__":

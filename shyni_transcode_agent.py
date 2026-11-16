@@ -8,6 +8,7 @@ GitHub self-hosted runner 처럼 쓴다. Shyni 관리자 화면(설정 → 관�
     shyni_transcode_agent.py install --url https://shyni.example --token shr_… [--dir DIR]
     shyni_transcode_agent.py run [--dir DIR]
     shyni_transcode_agent.py status | update | uninstall [--dir DIR]
+    shyni_transcode_agent.py configure --rclone-remote NAME [--dir DIR]
     shyni_transcode_agent.py service install|uninstall [--dir DIR]
 
 보안 경계
@@ -15,6 +16,8 @@ GitHub self-hosted runner 처럼 쓴다. Shyni 관리자 화면(설정 → 관�
   이 에이전트가 자기 인코더에 맞춰 만든다. 입력은 http(s) 원본뿐이고 출력은 작업 폴더 안이다.
 - ffmpeg 는 원본을 이 에이전트의 loopback 프록시(127.0.0.1)로 읽는다. 클라우드 자격은
   프록시가 붙이므로 ffmpeg 명령줄에 남지 않고, 만료되면 프록시가 서버에서 새로 받는다.
+- rclone 리모트는 이 기기의 주인이 설치할 때 이름을 적어 준 것만 쓴다. 서버는 그 이름과
+  경로만 보내고, 자격은 이 기기의 rclone 설정에 있는 것을 쓴다.
 - 에이전트는 스스로 갱신되지 않는다. 새 버전은 이 기기에서 `update` 를 실행해 받는다.
 
 파일 하나, 표준 라이브러리만 쓴다(Python 3.9+).
@@ -23,6 +26,7 @@ GitHub self-hosted runner 처럼 쓴다. Shyni 관리자 화면(설정 → 관�
 from __future__ import annotations
 
 import argparse
+import base64
 import glob
 import hashlib
 import http.client
@@ -31,6 +35,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import select
 import shutil
 import signal
@@ -48,7 +53,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.1.1"  # 0.1.1: 413 원인 안내, macOS 외장 디스크 권한 안내·로그 위치
+__version__ = "0.2.0"
 PROTOCOL_VERSION = 1
 # 이 파일이 공개된 곳. `update` 가 여기서 새 버전을 받는다.
 SOURCE_URL = os.environ.get(
@@ -954,13 +959,27 @@ def clean_spec(raw: dict) -> dict:
     }
 
 
-def clean_source(raw: dict, server_host: str) -> dict:
-    """원본은 http(s) 주소만 받는다. 서버 자신이 아닌 내부망·loopback 주소는 거절한다 —
-    서버가 이 기기를 발판으로 같은 망의 다른 장비에 요청을 보내게 두지 않는다."""
+def clean_source(raw: dict, server_host: str, rclone_remotes=()) -> dict:
+    """원본은 셋 중 하나다: 서버가 내주는 파일, http(s) 주소, 이 기기의 rclone 리모트 안의 경로.
+
+    http(s) 주소는 서버 자신이 아닌 내부망·loopback 이면 거절한다 — 서버가 이 기기를 발판으로
+    같은 망의 다른 장비에 요청을 보내게 두지 않는다. rclone 은 설치할 때 허용한 리모트만 받는다."""
     if not isinstance(raw, dict):
         raise AgentError("원본 정보가 없습니다")
     if raw.get("kind") == "server":
         return {"kind": "server"}
+    if raw.get("kind") == "rclone":
+        remote = str(raw.get("remote") or "")
+        if remote not in rclone_remotes:
+            raise AgentError("이 기기에 허용되지 않은 rclone 리모트입니다: %s" % remote[:64])
+        folder_id = str(raw.get("folder_id") or "")
+        if folder_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", folder_id):
+            raise AgentError("rclone 폴더 ID 형식이 올바르지 않습니다")
+        path = str(raw.get("path") or "")
+        parts = path.split("/")
+        if len(path) > 4096 or any(part in ("", ".", "..") or _CONTROL_RE.search(part) for part in parts):
+            raise AgentError("rclone 원본 경로가 올바르지 않습니다")
+        return {"kind": "rclone", "remote": remote, "folder_id": folder_id, "path": path}
     if raw.get("kind") != "url":
         raise AgentError("모르는 원본 종류입니다")
     url = str(raw.get("url") or "")
@@ -983,6 +1002,110 @@ def clean_source(raw: dict, server_host: str) -> dict:
     return {"kind": "url", "url": url, "headers": headers}
 
 
+# ══ rclone 리모트로 원본 읽기 ═════════════════════════════════════════
+_REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+@ -]{0,63}")
+
+
+def rclone_list_remotes(binary: str, config_path) -> list:
+    args = [binary, "listremotes"] + (["--config", config_path] if config_path else [])
+    return [line.strip()[:-1] for line in _command_output(args, timeout=20).splitlines()
+            if line.strip().endswith(":")]
+
+
+def usable_rclone_remotes(data: dict) -> list:
+    """설치할 때 허용한 리모트 가운데 지금 이 기기의 rclone 설정에 실제로 있는 것."""
+    wanted = [name for name in data.get("rclone_remotes") or [] if _REMOTE_NAME_RE.fullmatch(str(name))]
+    if not wanted:
+        return []
+    binary = data.get("rclone") or "rclone"
+    if not (shutil.which(binary) or os.path.isfile(binary)):
+        log("rclone 을 찾을 수 없어 rclone 리모트를 쓰지 않습니다: %s" % binary)
+        return []
+    present = set(rclone_list_remotes(binary, data.get("rclone_config")))
+    missing = [name for name in wanted if name not in present]
+    if missing:
+        log("rclone 설정에 없는 리모트는 쓰지 않습니다: %s" % ", ".join(missing))
+    return [name for name in wanted if name in present]
+
+
+class RcloneServers:
+    """이 기기의 rclone 으로 원본을 읽는다. 리모트(와 루트 폴더)마다 `rclone serve http` 를
+    127.0.0.1 에 하나 띄워 두고 계속 쓴다 — 폴더 목록이 rclone 안에 남아 다음 작업이 빠르다.
+
+    자격은 이 기기의 rclone 설정에 있다. 구글 공유 드라이브처럼 조회용 토큰과 읽기용 자격이
+    다른 리모트도 rclone 이 알아서 처리하므로, 서버는 리모트 이름과 경로만 알려 주면 된다.
+    """
+
+    def __init__(self, binary: str, config_path, log_dir: Path):
+        self.binary, self.config_path, self.log_dir = binary, config_path, log_dir
+        self._servers: dict = {}
+        self._lock = threading.Lock()
+
+    def upstream(self, source: dict, fresh: bool = False) -> tuple:
+        key = (source["remote"], source["folder_id"])
+        with self._lock:
+            server = self._servers.get(key)
+            if server is not None and (fresh or server["proc"].poll() is not None):
+                self._stop(server)
+                server = None
+            if server is None:
+                server = self._servers[key] = self._start(*key)
+        url = "http://127.0.0.1:%d/%s" % (server["port"], urllib.parse.quote(source["path"]))
+        return url, {"Authorization": server["authorization"]}
+
+    def _start(self, remote: str, folder_id: str) -> dict:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        password = secrets.token_hex(16)
+        target = "%s:{%s}" % (remote, folder_id) if folder_id else remote + ":"
+        args = [self.binary, "serve", "http", target, "--addr", "127.0.0.1:%d" % port,
+                "--read-only", "--vfs-cache-mode", "off", "--dir-cache-time", "30m", "--poll-interval", "0"]
+        if self.config_path:
+            args += ["--config", self.config_path]
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self.log_dir / ("rclone-%s.log" % re.sub(r"[^A-Za-z0-9_.-]", "_", remote))
+        with open(log_path, "wb") as errors:
+            # 접속 암호는 환경변수로 넘겨 명령줄(ps)에 남기지 않는다.
+            proc = subprocess.Popen(
+                args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors,
+                env={**os.environ, "RCLONE_USER": "shyni", "RCLONE_PASS": password},
+            )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and proc.poll() is None:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                log("rclone serve http 시작: %s (포트 %d)" % (target, port))
+                token = "%s:%s" % ("shyni", password)
+                return {"proc": proc, "port": port,
+                        "authorization": "Basic " + base64.b64encode(token.encode()).decode()}
+            except OSError:
+                time.sleep(0.2)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            detail = log_path.read_text(errors="replace").strip().splitlines()[-1][:300]
+        except (OSError, IndexError):
+            detail = ""
+        raise AgentError("rclone 을 시작하지 못했습니다(%s): %s" % (target, detail))
+
+    @staticmethod
+    def _stop(server: dict) -> None:
+        try:
+            server["proc"].terminate()
+            server["proc"].wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def close(self) -> None:
+        with self._lock:
+            for server in self._servers.values():
+                self._stop(server)
+            self._servers.clear()
+
+
 # ══ 원본 loopback 프록시 ══════════════════════════════════════════════
 class SourceProxy:
     """ffmpeg ↔ 원본 사이의 127.0.0.1 프록시.
@@ -992,8 +1115,9 @@ class SourceProxy:
     서버에서 새로 받아 다시 요청한다. 긴 영화도 한 시간짜리 토큰에 묶이지 않는다.
     """
 
-    def __init__(self, api: Api):
+    def __init__(self, api: Api, rclone=None):
         self.api = api
+        self.rclone = rclone
         self.jobs: dict = {}
         proxy = self
 
@@ -1017,13 +1141,17 @@ class SourceProxy:
     def url_for(self, job, what: str) -> str:
         return "http://127.0.0.1:%d/%s/%s/%s" % (self.port, job.id, job.nonce, what)
 
-    def _upstream(self, job, what: str) -> tuple:
+    def _upstream(self, job, what: str, fresh: bool = False) -> tuple:
         authorization = {"Authorization": "Bearer " + self.api.token}
         if what == "subtitle":
             return self.api.base_url + "/transcode-agent/jobs/%s/subtitle" % job.id, authorization
         source = job.source
         if source["kind"] == "server":
             return self.api.base_url + "/transcode-agent/jobs/%s/source" % job.id, authorization
+        if source["kind"] == "rclone":
+            if self.rclone is None:
+                raise AgentError("이 기기는 rclone 원본을 쓰도록 설정되지 않았습니다")
+            return self.rclone.upstream(source, fresh)
         return source["url"], dict(source["headers"])
 
     def _open(self, url: str, headers: dict, redirects: int = 5):
@@ -1033,8 +1161,12 @@ class SourceProxy:
                 parsed.hostname, parsed.port, timeout=60, context=ssl.create_default_context())
         else:
             conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=60)
+        send = dict(headers)
+        if not any(key.lower() == "user-agent" for key in send):
+            # 115 처럼 발급할 때의 User-Agent 로만 열리는 주소가 있다 — 원본이 준 것을 그대로 쓴다.
+            send["User-Agent"] = USER_AGENT
         conn.request("GET", (parsed.path or "/") + ("?" + parsed.query if parsed.query else ""),
-                     headers={"User-Agent": USER_AGENT, **headers})
+                     headers=send)
         response = conn.getresponse()
         if response.status in (301, 302, 303, 307, 308) and redirects > 0:
             location = urllib.parse.urljoin(url, response.getheader("location") or "")
@@ -1060,23 +1192,32 @@ class SourceProxy:
         sent_headers = False
         refreshed = False
         failures = 0
+        # 응답마다 연결을 닫고, 닫는다고 알린다. 알리지 않으면 ffmpeg 가 같은 연결로 다음 요청을
+        # 보내려다(탐색) 실패하고, 파일 끝의 색인을 못 읽어 처음부터 훑게 된다.
+        request.close_connection = True
         while True:
             conn = None
             try:
-                url, headers = self._upstream(job, what)
+                url, headers = self._upstream(job, what, fresh=refreshed)
                 if range_header or sent_headers:
                     headers["Range"] = "bytes=%d-%s" % (offset, end)
                 conn, response = self._open(url, headers)
-                if response.status in (401, 403) and what == "media" and not refreshed \
-                        and job.source["kind"] == "url":
+                renewable = what == "media" and not refreshed and not sent_headers
+                if renewable and job.source["kind"] == "url" and response.status in (401, 403):
                     refreshed = True
                     response.read()
                     job.refresh_source()
+                    continue
+                if renewable and job.source["kind"] == "rclone" and response.status == 404:
+                    # 방금 추가된 파일은 rclone 이 기억하는 폴더 목록에 없을 수 있다 — 새로 띄워 다시 본다.
+                    refreshed = True
+                    response.read()
                     continue
                 if response.status >= 400 or (sent_headers and response.status != 206):
                     if not sent_headers:
                         request.send_response(response.status)
                         request.send_header("Content-Length", "0")
+                        request.send_header("Connection", "close")
                         request.end_headers()
                     return
                 if not sent_headers:
@@ -1085,10 +1226,7 @@ class SourceProxy:
                         value = response.getheader(name)
                         if value:
                             request.send_header(name, value)
-                    if not response.getheader("Content-Length"):
-                        # 길이를 모르면 연결을 닫아 끝을 알린다.
-                        request.send_header("Connection", "close")
-                        request.close_connection = True
+                    request.send_header("Connection", "close")
                     request.end_headers()
                     sent_headers = True
                 if not body:
@@ -1138,7 +1276,8 @@ class Job(threading.Thread):
         if self.kind not in ("hls", "pipe"):
             raise AgentError("모르는 작업 종류입니다")
         self.spec = clean_spec(command.get("spec"))
-        self.source = clean_source(command.get("source"), agent.api.host)
+        self.source = clean_source(
+            command.get("source"), agent.api.host, getattr(agent, "rclone_remotes", ()))
         self.has_subtitle_file = command.get("has_subtitle_file") is True
         self.nonce = hashlib.sha256(os.urandom(32)).hexdigest()[:32]
         self.dir = agent.config.tmp_dir / ("job_" + self.id)
@@ -1388,7 +1527,11 @@ class Agent:
         self.caps = detect_capabilities(self.ffmpeg, config.encoder)
         self.info = machine_info()
         self.jobs: dict = {}
-        self.proxy = SourceProxy(self.api)
+        self.rclone_remotes = usable_rclone_remotes(data)
+        self.rclone = RcloneServers(
+            data.get("rclone") or "rclone", data.get("rclone_config"), config.tmp_dir,
+        ) if self.rclone_remotes else None
+        self.proxy = SourceProxy(self.api, self.rclone)
         self.running = True
         self._told_protocol = False
         self._told_local_network = False
@@ -1407,7 +1550,7 @@ class Agent:
         return {
             "protocol": PROTOCOL_VERSION, "agent_version": __version__,
             "platform": self.info,
-            "capabilities": public_capabilities(self.caps),
+            "capabilities": public_capabilities(self.caps, self.rclone_remotes),
             "recommended_slots": self.recommended_slots(),
             "temp_dir": str(tmp_dir), "temp_free_bytes": free,
             "jobs": list(self.jobs), "wait": POLL_WAIT_SEC,
@@ -1458,6 +1601,8 @@ class Agent:
             __version__, self.api.base_url, self.caps.get("video_encoder"),
             "H/W" if self.caps.get("hw_encoder") else "S/W", bool(self.caps.get("tonemap")),
             self.recommended_slots(), tmp_dir))
+        if self.rclone_remotes:
+            log("rclone 으로 직접 읽을 리모트: %s" % ", ".join(self.rclone_remotes))
         if self.api.scheme == "http":
             log("주의: 서버 주소가 http 입니다. 같은 내부망이 아니면 https 주소로 등록하세요.")
         try:
@@ -1469,6 +1614,8 @@ class Agent:
             job.stop()
         for job in list(self.jobs.values()):
             job.join(timeout=5)
+        if self.rclone is not None:
+            self.rclone.close()
         return 0
 
     def _serve(self) -> None:
@@ -1536,20 +1683,48 @@ def kill_leftover_ffmpeg(job_dir: Path) -> None:
     log("이전 실행이 남긴 ffmpeg 정리: pid=%d" % pid)
 
 
-def public_capabilities(caps: dict) -> dict:
+def public_capabilities(caps: dict, rclone_remotes=()) -> dict:
     return {
         "video_encoder": caps.get("video_encoder"), "hw_encoder": caps.get("hw_encoder"),
         "tonemap": bool(caps.get("tonemap")), "ffmpeg_version": caps.get("ffmpeg_version"),
+        # 이 기기의 rclone 으로 직접 읽을 수 있는 리모트 — 서버가 같은 이름의 원본을 맡길 때 쓴다.
+        "rclone_remotes": list(rclone_remotes),
     }
 
 
 # ══ 명령 ══════════════════════════════════════════════════════════════
-def _describe(caps: dict, ffmpeg: str, slots: int, tmp_dir: Path) -> None:
+def _describe(caps: dict, ffmpeg: str, slots: int, tmp_dir: Path, rclone_remotes=()) -> None:
     print("  인코더   : %s (%s)" % (caps.get("video_encoder"), "H/W" if caps.get("hw_encoder") else "S/W"))
     print("  톤매핑   : %s" % ("가능" if caps.get("tonemap") else "불가"))
     print("  ffmpeg   : %s (%s)" % (ffmpeg, caps.get("ffmpeg_version")))
     print("  추천 슬롯: %d" % slots)
     print("  임시 폴더: %s" % tmp_dir)
+    print("  rclone   : %s" % (", ".join(rclone_remotes) if rclone_remotes else "쓰지 않음(원본은 서버나 클라우드 주소로 읽음)"))
+
+
+def apply_rclone_options(config: Config, args) -> None:
+    """--rclone-remote 로 적은 리모트를 이 기기의 rclone 설정에서 확인하고 허용 목록에 올린다."""
+    if getattr(args, "rclone", None):
+        config.data["rclone"] = args.rclone
+    if getattr(args, "rclone_config", None):
+        config.data["rclone_config"] = str(Path(args.rclone_config).expanduser().resolve())
+    remotes = getattr(args, "rclone_remote", None)
+    if remotes is None:
+        return
+    remotes = [name for name in dict.fromkeys(remotes) if name]
+    for name in remotes:
+        if not _REMOTE_NAME_RE.fullmatch(name):
+            raise AgentError("rclone 리모트 이름이 올바르지 않습니다: %s" % name)
+    if remotes:
+        binary = config.data.get("rclone") or "rclone"
+        if not (shutil.which(binary) or os.path.isfile(binary)):
+            raise AgentError("rclone 을 찾을 수 없습니다: %s (--rclone 로 경로를 지정하세요)" % binary)
+        present = rclone_list_remotes(binary, config.data.get("rclone_config"))
+        missing = [name for name in remotes if name not in present]
+        if missing:
+            raise AgentError("이 기기의 rclone 설정에 없는 리모트입니다: %s (있는 것: %s)" % (
+                ", ".join(missing), ", ".join(present) or "없음"))
+    config.data["rclone_remotes"] = remotes
 
 
 def command_install(args) -> int:
@@ -1568,6 +1743,8 @@ def command_install(args) -> int:
     config.data.update({"server_url": api.base_url, "tmp_dir": str(tmp_dir), "encoder": encoder})
     if args.slots:
         config.data["slots"] = max(1, int(args.slots))
+    apply_rclone_options(config, args)
+    rclone_remotes = usable_rclone_remotes(config.data)
     ffmpeg, caps = choose_ffmpeg(config, args.ffmpeg)
     slots = recommended_slots(caps)
     if args.slots:
@@ -1579,7 +1756,7 @@ def command_install(args) -> int:
     registered = api.call("POST", "/transcode-agent/register", {
         "name": args.name or socket.gethostname().split(".")[0],
         "protocol": PROTOCOL_VERSION, "agent_version": __version__,
-        "platform": machine_info(), "capabilities": public_capabilities(caps),
+        "platform": machine_info(), "capabilities": public_capabilities(caps, rclone_remotes),
         "recommended_slots": slots, "temp_dir": str(tmp_dir), "temp_free_bytes": free,
     })
     config.data.update({
@@ -1589,7 +1766,7 @@ def command_install(args) -> int:
     config.save()
     print()
     print("등록 완료: %s (러너 #%s)" % (registered["name"], registered["runner_id"]))
-    _describe(caps, ffmpeg, slots, tmp_dir)
+    _describe(caps, ffmpeg, slots, tmp_dir, rclone_remotes)
     hint = hardware_hint(caps, config.encoder)
     if hint:
         print("  참고     : " + hint)
@@ -1622,7 +1799,25 @@ def command_status(args) -> int:
     print("에이전트 %s" % __version__)
     print("  서버     : %s" % config.data["server_url"])
     print("  러너     : %s (#%s)" % (config.data.get("name"), config.data.get("runner_id")))
-    _describe(caps, config.data["ffmpeg"], recommended_slots(caps), config.tmp_dir)
+    _describe(caps, config.data["ffmpeg"], recommended_slots(caps), config.tmp_dir,
+              usable_rclone_remotes(config.data))
+    return 0
+
+
+def command_configure(args) -> int:
+    """등록은 그대로 두고 이 기기의 설정만 바꾼다(rclone 리모트·동시 작업 상한)."""
+    config = _require_config(args)
+    apply_rclone_options(config, args)
+    if args.slots is not None:
+        if args.slots > 0:
+            config.data["slots"] = int(args.slots)
+        else:
+            config.data.pop("slots", None)
+    config.save()
+    print("저장했습니다.")
+    print("  rclone   : %s" % (", ".join(usable_rclone_remotes(config.data)) or "쓰지 않음"))
+    print("  작업 상한: %s" % (config.data.get("slots") or "추천값"))
+    _restart_service()
     return 0
 
 
@@ -1809,6 +2004,13 @@ def main(argv=None) -> int:
         item.add_argument("--dir", default=str(default_home()), help="에이전트 폴더")
         return item
 
+    def add_rclone_options(item) -> None:
+        item.add_argument("--rclone-remote", action="append", metavar="NAME",
+                          help="이 기기의 rclone 으로 직접 읽을 리모트 이름(여러 번 쓸 수 있음). "
+                               "서버의 원본 리모트와 같은 이름이어야 한다")
+        item.add_argument("--rclone", metavar="PATH", help="rclone 실행 파일(기본: PATH 의 rclone)")
+        item.add_argument("--rclone-config", metavar="PATH", help="rclone 설정 파일(기본: rclone 기본 위치)")
+
     install = with_dir("install", "이 기기를 서버에 등록")
     install.add_argument("--url", help="Shyni 서버 주소")
     install.add_argument("--token", help="관리자 화면에서 발급한 등록 토큰")
@@ -1817,12 +2019,17 @@ def main(argv=None) -> int:
     install.add_argument("--ffmpeg", help="쓸 ffmpeg 경로(기본: 자동 선택·설치)")
     install.add_argument("--encoder", help="auto(기본) | software | nvenc | vaapi | qsv | videotoolbox")
     install.add_argument("--slots", type=int, help="이 기기가 받을 동시 작업 상한")
+    add_rclone_options(install)
     install.add_argument("--no-service", action="store_true", help="서비스로 등록하지 않음")
     install.add_argument("--force", action="store_true", help="이미 등록된 폴더에 다시 등록")
     install.set_defaults(handler=command_install)
     with_dir("run", "작업을 받아 실행").set_defaults(handler=command_run)
     with_dir("status", "이 기기의 인코더·설정 표시").set_defaults(handler=command_status)
     with_dir("update", "공개 저장소에서 새 에이전트 받기").set_defaults(handler=command_update)
+    configure = with_dir("configure", "이 기기의 설정 바꾸기(rclone 리모트·작업 상한)")
+    add_rclone_options(configure)
+    configure.add_argument("--slots", type=int, help="동시 작업 상한(0 이면 추천값으로)")
+    configure.set_defaults(handler=command_configure)
     with_dir("uninstall", "서비스와 등록 정보 제거").set_defaults(handler=command_uninstall)
     service = with_dir("service", "자동 시작 서비스 등록/제거")
     service.add_argument("action", choices=("install", "uninstall"))

@@ -92,6 +92,43 @@ class FakeApi:
         pass
 
 
+class RejectingApi(FakeApi):
+    def __init__(self, body):
+        super().__init__()
+        self.body = body
+
+    def request(self, method, path, *, body=None, headers=None, timeout=60.0):
+        super().request(method, path, body=body, headers=headers, timeout=timeout)
+        return 413, {}, self.body
+
+
+class UploadLimitTests(unittest.TestCase):
+    def job(self, api, tmp):
+        fake = SimpleNamespace(api=api, config=SimpleNamespace(tmp_dir=Path(tmp)))
+        job = agent.Job(fake, {"id": JOB_ID, "kind": "hls", "spec": {"mode": "video"},
+                               "source": {"kind": "server"}})
+        job.dir.mkdir()
+        (job.dir / "seg00000.ts").write_bytes(b"x" * 2000)
+        return job
+
+    def test_proxy_limit_is_explained_and_not_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api = RejectingApi(b"<html><center><h1>413 Request Entity Too Large</h1></center>nginx</html>")
+            job = self.job(api, tmp)
+            with self.assertRaises(agent.UploadTooLarge) as error:
+                job._upload("seg00000.ts")
+            self.assertEqual(len(api.calls), 1)
+            self.assertIn("client_max_body_size", str(error.exception))
+
+    def test_server_refusal_keeps_the_server_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = self.job(RejectingApi(b'{"detail":"\ud30c\uc77c\uc774 \ub108\ubb34 \ud07d\ub2c8\ub2e4"}'), tmp)
+            with self.assertRaises(agent.UploadTooLarge) as error:
+                job._upload("seg00000.ts")
+            self.assertIn("파일이 너무 큽니다", str(error.exception))
+            self.assertNotIn("client_max_body_size", str(error.exception))
+
+
 class UploadOrderTests(unittest.TestCase):
     def test_segments_go_up_before_the_playlist_that_lists_them(self):
         with tempfile.TemporaryDirectory() as tmp:

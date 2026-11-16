@@ -48,7 +48,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"  # 0.1.1: 413 원인 안내, macOS 외장 디스크 권한 안내·로그 위치
 PROTOCOL_VERSION = 1
 # 이 파일이 공개된 곳. `update` 가 여기서 새 버전을 받는다.
 SOURCE_URL = os.environ.get(
@@ -104,6 +104,16 @@ class Unauthorized(AgentError):
 
 class JobGone(AgentError):
     """서버가 그 작업을 더는 모른다(끝났거나 취소됨)."""
+
+
+class UploadTooLarge(AgentError):
+    """업로드가 너무 커서 거절됐다(413). 다시 보내도 같으므로 재시도하지 않는다."""
+
+
+PROXY_UPLOAD_HINT = (
+    "서버 앞의 리버스 프록시가 업로드를 막았습니다(HTTP 413). nginx 라면 /transcode-agent/ "
+    "위치에 client_max_body_size 64m; 를 넣으세요(README의 '리버스 프록시' 참고)."
+)
 
 
 # ══ 변환 파이프라인 ═══════════════════════════════════════════════════
@@ -692,16 +702,24 @@ class Api:
             raise Unauthorized(_detail(data) or "인증 실패")
         if status == 410:
             raise JobGone(_detail(data) or "작업 없음")
+        if status == 413:
+            # Shyni 가 거절했으면 JSON 설명이 오고, 앞단 프록시가 막았으면 HTML 오류 페이지가 온다.
+            detail = _json_detail(data)
+            raise UploadTooLarge("서버가 업로드를 거절했습니다(413): " + detail if detail else PROXY_UPLOAD_HINT)
         if status >= 400:
             raise AgentError("서버 오류 %d: %s" % (status, _detail(data)))
         return json.loads(data) if data else None
 
 
-def _detail(data: bytes) -> str:
+def _json_detail(data: bytes) -> str:
     try:
         return str(json.loads(data).get("detail") or "")[:300]
     except (ValueError, AttributeError):
-        return data.decode(errors="replace")[:300]
+        return ""
+
+
+def _detail(data: bytes) -> str:
+    return _json_detail(data) or data.decode(errors="replace")[:300]
 
 
 # ══ 이 기기 정보 ══════════════════════════════════════════════════════
@@ -1275,7 +1293,7 @@ class Job(threading.Thread):
                 status, _, reply = self.agent.api.request(
                     method, path, body=body, headers=headers, timeout=timeout)
                 return Api.decode(status, reply)
-            except (JobGone, Unauthorized):
+            except (JobGone, Unauthorized, UploadTooLarge):
                 raise
             except AgentError:
                 if attempt == attempts - 1 or self.stopped.is_set():
@@ -1373,6 +1391,7 @@ class Agent:
         self.proxy = SourceProxy(self.api)
         self.running = True
         self._told_protocol = False
+        self._told_local_network = False
 
     def recommended_slots(self) -> int:
         limit = self.config.data.get("slots")
@@ -1465,6 +1484,11 @@ class Agent:
                 continue
             except AgentError as exc:
                 log("%s — %d초 뒤 다시 연결합니다" % (exc, delay))
+                if ("No route to host" in str(exc) and platform.system() == "Darwin"
+                        and not self._told_local_network):
+                    self._told_local_network = True
+                    log("내부망 서버에 닿지 못합니다. macOS 가 서비스의 로컬 네트워크 접근을 막았을 수 "
+                        "있습니다: 시스템 설정 → 개인정보 보호 및 보안 → 로컬 네트워크에서 Python 을 켜세요.")
                 self._sleep(delay)
                 delay = min(delay * 2, 30)
                 continue
@@ -1572,6 +1596,9 @@ def command_install(args) -> int:
     if args.no_service:
         print("\n실행: %s %s run --dir %s" % (sys.executable, Path(__file__).resolve(), home))
         return 0
+    if _external_volume(home) or _external_volume(config.tmp_dir):
+        print("\n참고: 외장 디스크 폴더는 macOS 가 서비스(launchd)의 접근을 막습니다. "
+              "전체 디스크 접근 권한에 %s 를 추가해야 서비스로 돕니다." % sys.executable)
     return command_service(argparse.Namespace(dir=str(home), action="install"))
 
 
@@ -1639,6 +1666,46 @@ def _restart_service() -> None:
         print("실행 중인 에이전트를 다시 시작하세요.")
 
 
+def _macos_log_path() -> Path:
+    # 로그는 늘 내장 디스크에 둔다. launchd 는 외장 디스크의 로그 파일을 열지 못하면 아무것도
+    # 남기지 않고 실행 자체를 포기한다(EX_CONFIG) — 그러면 왜 안 도는지 알 길이 없다.
+    return Path.home() / "Library" / "Logs" / "shyni-transcode-agent.log"
+
+
+def _external_volume(path: Path) -> bool:
+    return platform.system() == "Darwin" and str(path).startswith("/Volumes/")
+
+
+def _permission_hint(path) -> str:
+    return (
+        "macOS 가 이 폴더 접근을 막았습니다: %s\n"
+        "  launchd 서비스로 도는 프로그램은 외장 디스크(/Volumes/…)에 접근할 수 없습니다. 둘 중 하나를 하세요.\n"
+        "  1) 시스템 설정 → 개인정보 보호 및 보안 → 전체 디스크 접근 권한에 %s 를 추가\n"
+        "  2) 에이전트 폴더(--dir)와 임시 폴더(--tmp)를 내장 디스크로 옮기기"
+    ) % (path, sys.executable)
+
+
+def _macos_service_check(home: Path, log_path: Path) -> None:
+    """서비스를 띄운 뒤 몇 초 기다려 실제로 도는지 확인하고, 안 돌면 이유를 알려 준다."""
+    time.sleep(4)
+    state = _command_output(["launchctl", "print", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)])
+    try:
+        tail = log_path.read_text(errors="replace")[-2000:]
+    except OSError:
+        tail = ""
+    running = "state = running" in state
+    if running and "에이전트 " in tail and "시작" in tail:
+        print("서비스 동작 확인됨")
+    elif "Operation not permitted" in tail or "접근을 막았습니다" in tail:
+        print("\n서비스가 폴더에 접근하지 못했습니다:\n" + _permission_hint(home))
+    elif running and not tail.strip() and _external_volume(home):
+        # 앱 묶음인 Python 은 외장 디스크에 처음 접근할 때 macOS 가 묻는 창을 띄우고 기다린다.
+        print("\nmacOS 가 'Python' 의 외장 디스크 접근을 묻는 창을 띄웠을 수 있습니다. 허용하면 바로 "
+              "시작합니다. 거부했다면:\n" + _permission_hint(home))
+    else:
+        print("서비스가 아직 돌지 않습니다. 로그를 확인하세요: %s" % log_path)
+
+
 def command_service(args) -> int:
     home = Path(args.dir).expanduser().resolve()
     command = [sys.executable, str(Path(__file__).resolve()), "run", "--dir", str(home)]
@@ -1655,7 +1722,9 @@ def command_service(args) -> int:
             return 0
         path.parent.mkdir(parents=True, exist_ok=True)
         arguments = "".join("    <string>%s</string>\n" % _xml(item) for item in command)
-        log_path = _xml(str(home / "agent.log"))
+        log_file = _macos_log_path()
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_path = _xml(str(log_file))
         path.write_text(
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -1664,6 +1733,7 @@ def command_service(args) -> int:
             "  <key>Label</key><string>%s</string>\n"
             "  <key>ProgramArguments</key><array>\n%s  </array>\n"
             "  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n"
+            "  <key>ThrottleInterval</key><integer>30</integer>\n"
             "  <key>ProcessType</key><string>Interactive</string>\n"
             "  <key>StandardOutPath</key><string>%s</string>\n"
             "  <key>StandardErrorPath</key><string>%s</string>\n"
@@ -1673,7 +1743,8 @@ def command_service(args) -> int:
         code = subprocess.call(["launchctl", "bootstrap", target, str(path)])
         if code == 0:
             print("서비스 등록됨(로그인하면 자동 시작): %s" % path)
-            print("로그: %s" % (home / "agent.log"))
+            print("로그: %s" % log_file)
+            _macos_service_check(home, log_file)
         else:
             print("launchctl 등록 실패 — 직접 실행: " + " ".join(command))
         return code
@@ -1762,6 +1833,12 @@ def main(argv=None) -> int:
         return args.handler(args)
     except AgentError as exc:
         print("오류: %s" % exc, file=sys.stderr)
+        return 1
+    except PermissionError as exc:
+        print(time.strftime("%Y-%m-%d %H:%M:%S ") + _permission_hint(exc.filename or args.dir),
+              file=sys.stderr, flush=True)
+        if os.environ.get("XPC_SERVICE_NAME") == SERVICE_LABEL:
+            time.sleep(300)    # launchd 가 곧바로 다시 띄워 로그를 채우지 않게
         return 1
 
 

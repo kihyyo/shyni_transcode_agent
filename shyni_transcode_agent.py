@@ -24,6 +24,10 @@ GitHub self-hosted runner 처럼 쓴다. Shyni 관리자 화면(설정 → 관�
   경로만 보내고, 자격은 이 기기의 rclone 설정에 있는 것을 쓴다.
 - 에이전트는 스스로 갱신되지 않는다. 새 버전은 이 기기에서 `update` 를 실행해 받는다.
 
+macOS·Linux·Windows 에서 같은 파일이 돈다. 설치는 이 기기의 OS 와 GPU 를 보고 인코더를 실측해
+고르고, 로그인하면 자동으로 시작하게 등록한다(macOS LaunchAgent, Linux systemd, Windows 시작
+프로그램).
+
 파일 하나, 표준 라이브러리만 쓴다(Python 3.9+).
 """
 
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import glob
 import hashlib
 import http.client
@@ -59,7 +64,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 PROTOCOL_VERSION = 1
 # 이 파일이 공개된 곳. `update` 가 여기서 새 버전을 받는다.
 SOURCE_URL = os.environ.get(
@@ -77,6 +82,19 @@ RECONNECT_LOG_EVERY_SEC = 60
 USER_AGENT = "shyni-transcode-agent/" + __version__
 SERVICE_LABEL = "com.shyni.transcode-agent"
 SYSTEMD_UNIT = "shyni-transcode-agent.service"
+# Windows 는 현재 사용자의 시작 프로그램(HKCU …\Run)에 등록한다. 관리자 권한이 필요 없고, 로그인해
+# 있는 동안 돈다 — macOS LaunchAgent·Linux systemd --user 와 같은 범위다.
+WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+WINDOWS_RUN_VALUE = "ShyniTranscodeAgent"
+# 서비스(Windows)로 도는 에이전트에게 다른 명령(configure·update·uninstall)이 남기는 요청 파일.
+RESTART_REQUEST = "restart.request"
+STOP_REQUEST = "stop.request"
+AGENT_LOG = "agent.log"
+AGENT_LOG_ROTATE_BYTES = 10 * 1024 * 1024
+WINDOWS = os.name == "nt"
+# 콘솔 없이 도는 에이전트(Windows 의 pythonw)가 ffmpeg·rclone 을 띄울 때마다 콘솔 창이 번쩍이지
+# 않게 한다(CREATE_NO_WINDOW). 다른 OS 에는 없는 옵션이다.
+POPEN_FLAGS = {"creationflags": 0x08000000} if WINDOWS else {}
 MIN_FREE_BYTES = 500 * 1024 * 1024
 PIPE_CHUNK_BYTES = 256 * 1024
 
@@ -151,13 +169,18 @@ TONEMAP_CHAIN = (
     "zscale=primaries=bt709,tonemap=tonemap=hable:desat=0,"
     "zscale=transfer=bt709:matrix=bt709:range=tv,format=yuv420p"
 )
-HW_ENCODER_CANDIDATES = ("h264_nvenc", "h264_vaapi", "h264_qsv", "h264_videotoolbox")
+HW_ENCODER_CANDIDATES = ("h264_nvenc", "h264_vaapi", "h264_qsv", "h264_amf", "h264_videotoolbox")
 KNOWN_ENCODERS = (*HW_ENCODER_CANDIDATES, "libx264")
 ENCODER_ALIASES = {
     "auto": "auto", "software": "libx264", "sw": "libx264", "libx264": "libx264",
-    "nvenc": "h264_nvenc", "vaapi": "h264_vaapi", "qsv": "h264_qsv",
+    "nvenc": "h264_nvenc", "vaapi": "h264_vaapi", "qsv": "h264_qsv", "amf": "h264_amf",
     "videotoolbox": "h264_videotoolbox",
 }
+# Windows: 이 기기에 있는 GPU 제조사(레지스트리의 디스플레이 어댑터)에 맞는 인코더를 먼저 시험한다.
+# 외장 그래픽(NVIDIA·AMD)이 내장(Intel)보다 앞이다.
+WINDOWS_GPU_VENDOR_IDS = {"10de": "nvidia", "1002": "amd", "8086": "intel"}
+WINDOWS_VENDOR_ENCODERS = (("nvidia", "h264_nvenc"), ("amd", "h264_amf"), ("intel", "h264_qsv"))
+WINDOWS_DISPLAY_CLASS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
 DEFAULT_VAAPI_DEVICE = "/dev/dri/renderD128"
 HW_PROBE_TIMEOUT_SEC = 20
 # 비디오 변환의 출력 코덱, 선호 순. H.264 가 기본이고, HEVC·AV1 은 이 기기의 H.264 H/W 인코더와 같은
@@ -168,6 +191,7 @@ HW_CODEC_ENCODERS = {
     "h264_nvenc": {"hevc": "hevc_nvenc", "av1": "av1_nvenc"},
     "h264_vaapi": {"hevc": "hevc_vaapi", "av1": "av1_vaapi"},
     "h264_qsv": {"hevc": "hevc_qsv", "av1": "av1_qsv"},
+    "h264_amf": {"hevc": "hevc_amf", "av1": "av1_amf"},
     "h264_videotoolbox": {"hevc": "hevc_videotoolbox"},
 }
 # 같은 화질을 내는 비트레이트의 H.264 대비 비율(분자, 분모): HEVC 2/3, AV1 3/5.
@@ -228,7 +252,7 @@ def run_ffmpeg(ffmpeg: str, args: list, timeout: float = 15.0, env=None) -> tupl
     try:
         done = subprocess.run(
             [ffmpeg, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL, timeout=timeout, env=env,
+            stdin=subprocess.DEVNULL, timeout=timeout, env=env, **POPEN_FLAGS,
         )
     except subprocess.TimeoutExpired:
         return -1, "timeout"
@@ -271,6 +295,162 @@ def encoder_environment(caps: dict):
     return {**os.environ, "LIBVA_DRIVER_NAME": driver} if driver else None
 
 
+# ══ Windows ═══════════════════════════════════════════════════════════
+# POSIX 의 SIGSTOP·자식 정리·/dev 장치 대신 쓰는 것들. ctypes·winreg 는 Windows 에서만 불러온다.
+def windows_gpus() -> list:
+    """이 Windows 기기의 디스플레이 어댑터 [(제조사, 이름)]. 제조사는 nvidia·amd·intel 또는 ""."""
+    if not WINDOWS:
+        return []
+    import winreg
+    found = []
+    try:
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, WINDOWS_DISPLAY_CLASS_KEY)
+    except OSError:
+        return []
+    with root:
+        index = 0
+        while True:
+            try:
+                name = winreg.EnumKey(root, index)
+            except OSError:
+                break
+            index += 1
+            if not name.isdigit():          # 0000, 0001 … 만 어댑터다(Properties 등은 건너뜀)
+                continue
+            try:
+                with winreg.OpenKey(root, name) as key:
+                    description = str(winreg.QueryValueEx(key, "DriverDesc")[0])
+                    try:
+                        device_id = str(winreg.QueryValueEx(key, "MatchingDeviceId")[0]).lower()
+                    except OSError:
+                        device_id = ""
+            except OSError:
+                continue
+            match = re.search(r"ven_([0-9a-f]{4})", device_id)
+            found.append((WINDOWS_GPU_VENDOR_IDS.get(match.group(1), "") if match else "", description))
+    return found
+
+
+def _windows_gpu_vendors() -> tuple:
+    """H/W 인코더를 시험할 GPU 제조사, 외장 그래픽부터. 읽지 못하면 빈 튜플(전부 시험)."""
+    present = {vendor for vendor, _name in windows_gpus()}
+    return tuple(vendor for vendor, _encoder in WINDOWS_VENDOR_ENCODERS if vendor in present)
+
+
+_WINDOWS_API: dict = {}
+_WINDOWS_API_LOCK = threading.Lock()
+
+
+def _windows_api() -> dict:
+    """kernel32·ntdll 함수. 처음 부를 때 64비트 HANDLE 이 잘리지 않게 시그니처를 정해 둔다."""
+    with _WINDOWS_API_LOCK:
+        if not _WINDOWS_API:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            ntdll = ctypes.WinDLL("ntdll")
+            handle = wintypes.HANDLE
+            kernel32.OpenProcess.restype = handle
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.CloseHandle.argtypes = (handle,)
+            kernel32.CreateJobObjectW.restype = handle
+            kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.SetInformationJobObject.argtypes = (handle, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+            kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            kernel32.AssignProcessToJobObject.argtypes = (handle, handle)
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.GetProcessTimes.argtypes = (handle,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+            ntdll.NtSuspendProcess.argtypes = (handle,)
+            ntdll.NtResumeProcess.argtypes = (handle,)
+            _WINDOWS_API.update(ctypes=ctypes, wintypes=wintypes, kernel32=kernel32, ntdll=ntdll, job=None)
+        return _WINDOWS_API
+
+
+def _windows_open_process(pid: int, access: int):
+    api = _windows_api()
+    handle = api["kernel32"].OpenProcess(access, False, pid)
+    if not handle:
+        raise OSError("OpenProcess(pid=%d) 실패: %d" % (pid, api["ctypes"].get_last_error()))
+    return handle
+
+
+def windows_suspend(pid: int, suspend: bool) -> bool:
+    """프로세스 전체를 멈추거나(0 CPU) 깨운다 — POSIX 의 SIGSTOP/SIGCONT. 서버의 hls_sessions 와 같다."""
+    try:
+        api = _windows_api()
+        handle = _windows_open_process(pid, 0x0800)            # PROCESS_SUSPEND_RESUME
+    except OSError:
+        return False
+    try:
+        call = api["ntdll"].NtSuspendProcess if suspend else api["ntdll"].NtResumeProcess
+        return call(handle) == 0
+    finally:
+        api["kernel32"].CloseHandle(handle)
+
+
+def windows_end_with_agent(proc) -> None:
+    """이 자식 프로세스가 에이전트와 함께 끝나게 한다.
+
+    Windows 는 부모가 끝나도 자식이 남는다(멈춰 둔 ffmpeg 는 멈춘 채로). 자식을 '닫히면 안의
+    프로세스를 끝내는' 작업 개체에 넣어 두면, 에이전트가 어떻게 끝나든 OS 가 그 개체를 닫으며
+    자식도 끝낸다. 실패해도 작업은 그대로 돈다.
+    """
+    if not WINDOWS:
+        return
+    try:
+        api = _windows_api()
+        ctypes, wintypes, kernel32 = api["ctypes"], api["wintypes"], api["kernel32"]
+        with _WINDOWS_API_LOCK:
+            if api["job"] is None:
+                class IoCounters(ctypes.Structure):
+                    _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+                class BasicLimits(ctypes.Structure):
+                    _fields_ = [
+                        ("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD),
+                    ]
+
+                class ExtendedLimits(ctypes.Structure):
+                    _fields_ = [
+                        ("BasicLimitInformation", BasicLimits), ("IoInfo", IoCounters),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t),
+                    ]
+
+                job = kernel32.CreateJobObjectW(None, None)
+                if not job:
+                    raise OSError("CreateJobObject 실패: %d" % ctypes.get_last_error())
+                limits = ExtendedLimits()
+                limits.BasicLimitInformation.LimitFlags = 0x2000        # KILL_ON_JOB_CLOSE
+                if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+                    raise OSError("SetInformationJobObject 실패: %d" % ctypes.get_last_error())
+                api["job"] = job
+        handle = _windows_open_process(proc.pid, 0x0101)          # PROCESS_SET_QUOTA | TERMINATE
+        try:
+            if not kernel32.AssignProcessToJobObject(api["job"], handle):
+                raise OSError("AssignProcessToJobObject 실패: %d" % ctypes.get_last_error())
+        finally:
+            kernel32.CloseHandle(handle)
+    except OSError as exc:
+        log("자식 프로세스를 에이전트와 함께 끝나게 묶지 못했습니다(작업은 계속): %s" % exc)
+
+
+def windows_cpu_seconds(handle) -> float:
+    """그 프로세스가 쓴 CPU 시간(사용자 + 커널). 끝난 프로세스도 핸들이 열려 있으면 읽힌다."""
+    api = _windows_api()
+    times = [api["wintypes"].FILETIME() for _ in range(4)]   # 생성·종료·커널·사용자
+    if not api["kernel32"].GetProcessTimes(handle, *(api["ctypes"].byref(item) for item in times)):
+        return 0.0
+    return sum(item.dwHighDateTime << 32 | item.dwLowDateTime for item in times[2:]) / 1e7
+
+
 def _ordered_hw_encoder_candidates(preference: str) -> tuple:
     """이 기기에 실제로 보이는 장치 순서대로 시험할 인코더. 지정한 인코더도 실측을 통과해야 쓴다."""
     if preference == "libx264":
@@ -281,7 +461,8 @@ def _ordered_hw_encoder_candidates(preference: str) -> tuple:
     if system == "Darwin":
         return ("h264_videotoolbox",)
     if system == "Windows":
-        return ("h264_nvenc", "h264_qsv")
+        vendors = _windows_gpu_vendors()
+        return tuple(encoder for vendor, encoder in WINDOWS_VENDOR_ENCODERS if not vendors or vendor in vendors)
     if system != "Linux":
         return ()
     ordered: list = []
@@ -390,7 +571,8 @@ def _hw_decode_candidates(caps: dict) -> list:
         return [("videotoolbox", None, None)]
     if system == "Windows":
         # d3d11va 는 프레임을 내려받아야 해서 Intel·AMD 내장 GPU 에서 느리다. NVIDIA 만 쓴다.
-        return [("cuda", None, None)]
+        vendors = _windows_gpu_vendors()
+        return [("cuda", None, None)] if not vendors or "nvidia" in vendors else []
     if system != "Linux":
         return []
     found = []
@@ -458,10 +640,12 @@ def hw_decode_pays_off(software: tuple, hardware: tuple) -> bool:
 
 
 def _measure_ffmpeg(args: list, env, timeout: float = 30.0) -> tuple:
-    """ffmpeg 한 번의 (종료 코드, 걸린 시간, CPU 시간). Windows 는 CPU 를 재지 못해 0 이다."""
+    """ffmpeg 한 번의 (종료 코드, 걸린 시간, CPU 시간). CPU 를 재지 못하는 OS 에서는 0 이다."""
     started = time.monotonic()
     proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, env=env)
+                            stderr=subprocess.DEVNULL, env=env, **POPEN_FLAGS)
+    if WINDOWS:
+        return _wait_measuring_windows(proc, started, timeout)
     if not hasattr(os, "wait4"):
         try:
             return proc.wait(timeout=timeout), time.monotonic() - started, 0.0
@@ -480,6 +664,25 @@ def _measure_ffmpeg(args: list, env, timeout: float = 30.0) -> tuple:
             proc.wait()
             return -1, timeout, 0.0
         time.sleep(0.02)
+
+
+def _wait_measuring_windows(proc, started: float, timeout: float) -> tuple:
+    """Windows: 끝나기 전에 핸들을 열어 두고, 끝난 뒤 GetProcessTimes 로 CPU 시간을 읽는다."""
+    try:
+        handle = _windows_open_process(proc.pid, 0x1000)        # PROCESS_QUERY_LIMITED_INFORMATION
+    except OSError:
+        handle = None
+    try:
+        try:
+            code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return -1, timeout, 0.0
+        return code, time.monotonic() - started, windows_cpu_seconds(handle) if handle else 0.0
+    finally:
+        if handle:
+            _windows_api()["kernel32"].CloseHandle(handle)
 
 
 def probe_hw_decode(ffmpeg: str, caps: dict):
@@ -785,9 +988,10 @@ def build_transcode_args(
             pass                                  # 프레임이 이미 GPU 의 nv12 다
         elif vaapi_encoder:
             filters.append("format=nv12,hwupload")
-        elif video_encoder.endswith("_videotoolbox") or output_codec != "h264":
+        elif video_encoder.endswith(("_videotoolbox", "_amf")) or output_codec != "h264":
             # HEVC·AV1 은 어느 인코더든 8비트 4:2:0 으로 고정한다(10비트 원본이 Main 10 으로
-            # 나가지 않게 — 서버는 재생 기기가 그 코덱을 푼다는 것만 안다).
+            # 나가지 않게 — 서버는 재생 기기가 그 코덱을 푼다는 것만 안다). AMF 는 10비트(P010)
+            # 프레임을 받으면 H.264 도 실패하므로 같이 8비트로 넘긴다.
             filters.append("format=nv12")
         if filters:
             args += ["-vf", ",".join(filters)]
@@ -807,6 +1011,10 @@ def build_transcode_args(
             # HEVC·AV1: 품질 고정(-cq) 없이 비트레이트 모드 — 낮춘 비트레이트가 그대로 적용된다.
             # QSV·VAAPI 의 HEVC·AV1 도 같은 이유로 품질 옵션을 주지 않는다.
             args += ["-preset", "p4"]
+        elif video_encoder.endswith("_amf"):
+            # AMD AMF: 품질 고정 모드의 이름·범위가 드라이버·코덱마다 달라, 비트레이트 상한
+            # 모드(vbr_peak)로 둔다. 아래 -b:v·-maxrate 가 그대로 상한이 된다.
+            args += ["-quality", "balanced", "-rc", "vbr_peak"]
         args += ["-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate]
         if output_codec == "hevc":
             args += ["-tag:v", "hvc1"]        # Apple 재생기는 hvc1 sample entry 만 재생한다
@@ -1175,7 +1383,7 @@ def _detail(data: bytes) -> str:
 # ══ 이 기기 정보 ══════════════════════════════════════════════════════
 def _command_output(args: list, timeout: float = 5.0) -> str:
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout).stdout.strip()
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, **POPEN_FLAGS).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
 
@@ -1202,9 +1410,22 @@ def machine_info() -> dict:
             pass
         nvidia = _command_output(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
         info["gpu"] = nvidia.splitlines()[0] if nvidia else ""
+    elif system == "Windows":
+        info["os_version"] = platform.version()           # 10.0.22631 — release 는 11 도 "10" 이다
+        info["cpu"] = _windows_cpu_name() or platform.processor()
+        info["gpu"] = ", ".join(dict.fromkeys(name for _vendor, name in windows_gpus()))
     else:
         info["cpu"] = platform.processor()
     return {key: value for key, value in info.items() if value}
+
+
+def _windows_cpu_name() -> str:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+            return str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).strip()
+    except OSError:
+        return ""
 
 
 # ══ ffmpeg 준비 ═══════════════════════════════════════════════════════
@@ -1334,6 +1555,11 @@ def hardware_hint(caps: dict, preference: str) -> str:
                 "갖춘 뒤 에이전트를 다시 시작하면 다시 시험합니다.")
     if system == "Darwin":
         return "VideoToolbox H/W 인코딩이 통과하지 못해 S/W 로 등록합니다(가상 머신이거나 오래된 Mac)."
+    if system == "Windows":
+        names = ", ".join(name for _vendor, name in windows_gpus()) or "찾지 못함"
+        return ("H/W 인코더 시험을 통과하지 못해 S/W 로 등록합니다(GPU: %s). NVIDIA 는 그래픽 드라이버, "
+                "AMD 는 Adrenalin 드라이버, Intel 은 그래픽 드라이버가 최신이어야 합니다. 원격 데스크톱 세션"
+                "에서는 GPU 를 못 쓸 수 있습니다. 갖춘 뒤 에이전트를 다시 시작하면 다시 시험합니다." % names)
     return "H/W 인코더를 찾지 못해 S/W 로 등록합니다. GPU 드라이버를 확인하세요."
 
 
@@ -1588,8 +1814,9 @@ class RcloneServers:
             # 접속 암호는 환경변수로 넘겨 명령줄(ps)에 남기지 않는다.
             proc = subprocess.Popen(
                 args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors,
-                env={**os.environ, "RCLONE_RC_USER": "shyni", "RCLONE_RC_PASS": password},
+                env={**os.environ, "RCLONE_RC_USER": "shyni", "RCLONE_RC_PASS": password}, **POPEN_FLAGS,
             )
+        windows_end_with_agent(proc)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and proc.poll() is None:
             try:
@@ -2690,6 +2917,7 @@ class Job(threading.Thread):
         self.nonce = hashlib.sha256(os.urandom(32)).hexdigest()[:32]
         self.dir = agent.config.tmp_dir / ("job_" + self.id)
         self.proc = None
+        self._suspended = False   # Windows: NtSuspendProcess 는 횟수를 세므로 상태가 바뀔 때만 부른다
         self.hw_decode = None     # 이 작업에서 쓰는 하드웨어 디코더(없으면 소프트웨어)
         self.output_codec = "h264"   # 이 작업의 출력 코덱과 인코더(_choose_encoder)
         self.encoder = None
@@ -2710,7 +2938,16 @@ class Job(threading.Thread):
                 pass
 
     def pause(self, paused: bool) -> None:
-        """재생 위치보다 너무 앞서 변환했으면 서버가 멈추라고 한다(0 CPU). 다시 깨우면 이어 만든다."""
+        """재생 위치보다 너무 앞서 변환했으면 서버가 멈추라고 한다(0 CPU). 다시 깨우면 이어 만든다.
+
+        Windows 에는 SIGSTOP 이 없다. 그대로 두면 ffmpeg 가 파일 끝까지 변환해 서버로 올리므로
+        프로세스 전체를 NtSuspendProcess 로 멈춘다(서버가 자기 ffmpeg 를 멈추는 방식과 같다)."""
+        if WINDOWS:
+            proc = self.proc
+            if proc is not None and proc.poll() is None and paused != self._suspended:
+                if windows_suspend(proc.pid, paused):
+                    self._suspended = paused
+            return
         self._signal(getattr(signal, "SIGSTOP" if paused else "SIGCONT", None))
 
     def _signal(self, number) -> bool:
@@ -2865,10 +3102,12 @@ class Job(threading.Thread):
             self.proc = subprocess.Popen(
                 args, cwd=str(self.dir), stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE if self.kind == "pipe" else subprocess.DEVNULL,
-                stderr=errors, env=encoder_environment(agent.caps),
+                stderr=errors, env=encoder_environment(agent.caps), **POPEN_FLAGS,
             )
-        # 에이전트가 강제 종료되면 ffmpeg 가 남는다(멈춰 둔 것은 멈춘 채로). 다음 시작 때
-        # 정리할 수 있게 PID 를 적어 둔다.
+        self._suspended = False
+        # 에이전트가 강제 종료되면 ffmpeg 가 남는다(멈춰 둔 것은 멈춘 채로). Windows 는 에이전트와
+        # 함께 끝나게 묶고, POSIX 는 다음 시작 때 정리할 수 있게 PID 를 적어 둔다.
+        windows_end_with_agent(self.proc)
         (self.dir / "ffmpeg.pid").write_text(str(self.proc.pid))
         if self.stopped.is_set():
             self.stop()
@@ -3024,6 +3263,7 @@ class Agent:
         ) if self.rclone_remotes else None
         self.proxy = SourceProxy(None, self.rclone)
         self.running = True
+        self.restart_requested = False     # 서비스(Windows)로 돌 때 다른 명령이 다시 시작을 요청함
 
     def total_slots(self) -> int:
         """이 기기가 동시에 돌릴 작업 수 — 붙어 있는 모든 서버를 합친 한도다."""
@@ -3214,8 +3454,9 @@ class Agent:
 
 def kill_leftover_ffmpeg(job_dir: Path) -> None:
     """이전 실행이 남긴 작업의 ffmpeg 를 끝낸다. 그 PID 가 정말 그 작업의 ffmpeg 일 때만
-    (명령줄에 작업 폴더가 있을 때만) 건드린다 — PID 는 다른 프로세스가 다시 쓸 수 있다."""
-    if os.name == "nt":
+    (명령줄에 작업 폴더가 있을 때만) 건드린다 — PID 는 다른 프로세스가 다시 쓸 수 있다.
+    Windows 는 ffmpeg 를 에이전트와 함께 끝나게 묶어 두므로(windows_end_with_agent) 남지 않는다."""
+    if WINDOWS:
         return
     try:
         pid = int((job_dir / "ffmpeg.pid").read_text().strip())
@@ -3370,10 +3611,216 @@ def _require_config(args) -> Config:
 
 
 def command_run(args) -> int:
-    agent = Agent(_require_config(args))
-    signal.signal(signal.SIGINT, agent.shutdown)
-    signal.signal(signal.SIGTERM, agent.shutdown)
-    return agent.run()
+    config = _require_config(args)
+    background = bool(getattr(args, "background", False))
+    if background:
+        _redirect_output_to_log(config.home)
+    # 서비스가 재시작하는 동안 앞 프로세스가 잠금을 놓기를 기다린다.
+    lock = acquire_instance_lock(config.home, wait=60 if background else 30)
+    if lock is None:
+        message = "이 폴더의 에이전트가 이미 돌고 있습니다: %s" % config.home
+        if background:
+            log(message + " — 이 실행은 끝냅니다")
+            return 0
+        raise AgentError(message + " (서비스로 돌고 있으면 status 로 확인하세요. 직접 실행하려면 먼저 "
+                         "service uninstall)")
+    try:
+        agent = Agent(config)
+        signal.signal(signal.SIGINT, agent.shutdown)
+        signal.signal(signal.SIGTERM, agent.shutdown)
+        if background:
+            for name in (RESTART_REQUEST, STOP_REQUEST):        # 이전 실행에 남은 요청은 지난 일이다
+                _take_request(config.home / name)
+            threading.Thread(target=_watch_requests, args=(agent, config.home), name="requests",
+                             daemon=True).start()
+        code = agent.run()
+    finally:
+        release_instance_lock(lock)
+    if agent.restart_requested:
+        start_background_agent(config.home)
+    return code
+
+
+# ══ 한 폴더에 에이전트 하나 · Windows 서비스 ══════════════════════════════
+def acquire_instance_lock(home: Path, wait: float = 0.0):
+    """이 폴더의 에이전트가 둘 돌지 않게 잠근다(같은 러너 자격으로 둘이 붙으면 서버가 작업을 나눠 줄
+    수 없다). 잠금은 프로세스가 어떻게 끝나든 OS 가 푼다. wait 초 안에 잠그지 못하면 None."""
+    path = home / "agent.lock"
+    deadline = time.monotonic() + wait
+    while True:
+        handle = open(path, "a+b")
+        try:
+            if WINDOWS:
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except OSError as error:
+            if not WINDOWS and error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                # 잠금을 지원하지 않는 파일 시스템(잠금 없는 NFS 등)이다. 다른 에이전트가 잡고 있는 것이
+                # 아니므로 잠그지 않고 돈다 — 여기서 "이미 돌고 있음"으로 끝내면 에이전트가 아예 못 뜬다.
+                return handle
+            handle.close()
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.5)
+
+
+def release_instance_lock(handle) -> None:
+    try:
+        if WINDOWS:
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    handle.close()
+
+
+def agent_running(home: Path) -> bool:
+    lock = acquire_instance_lock(home)
+    if lock is None:
+        return True
+    release_instance_lock(lock)
+    return False
+
+
+def _take_request(path: Path) -> bool:
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _watch_requests(agent, home: Path) -> None:
+    """서비스(Windows)로 도는 에이전트: configure·update·uninstall 같은 명령이 남긴 요청을 따른다.
+    Windows 에는 systemctl restart 같은 서비스 관리자가 없어 이 파일들로 주고받는다."""
+    config_path = home / "config.json"
+    while agent.running:
+        time.sleep(2)
+        if _take_request(home / STOP_REQUEST) or not config_path.is_file():
+            log("중지 요청을 받아 에이전트를 끝냅니다")
+            agent.running = False
+        elif _take_request(home / RESTART_REQUEST):
+            log("설정이 바뀌어 에이전트를 다시 시작합니다")
+            agent.restart_requested = True
+            agent.running = False
+
+
+def _redirect_output_to_log(home: Path) -> Path:
+    """서비스(Windows 의 pythonw)에는 콘솔이 없다 — 출력을 <폴더>/agent.log 에 덧붙인다."""
+    path = home / AGENT_LOG
+    try:
+        if path.stat().st_size > AGENT_LOG_ROTATE_BYTES:
+            os.replace(str(path), str(path) + ".1")
+    except OSError:
+        pass
+    stream = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+    sys.stdout = sys.stderr = stream
+    return path
+
+
+def windows_service_command(home: Path) -> list:
+    """시작 프로그램에 적는 명령. pythonw 는 콘솔 창 없이 돈다."""
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    return [str(pythonw) if pythonw.is_file() else sys.executable,
+            str(Path(__file__).resolve()), "run", "--dir", str(home), "--background"]
+
+
+def start_background_agent(home: Path) -> bool:
+    """콘솔 없이 지금 띄운다. 설치한 PowerShell 창을 닫아도 남도록 그 창과 떼어 놓는다."""
+    if not WINDOWS:
+        return False
+    detached = 0x00000008 | 0x00000200                  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    for breakaway in (0x01000000, 0):                    # CREATE_BREAKAWAY_FROM_JOB(허용될 때만)
+        try:
+            subprocess.Popen(windows_service_command(home), cwd=str(home), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+                             creationflags=detached | breakaway)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _windows_autostart(command) -> None:
+    """현재 사용자의 시작 프로그램에 등록(command) 또는 제거(None)."""
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, WINDOWS_RUN_KEY) as key:
+        if command is None:
+            try:
+                winreg.DeleteValue(key, WINDOWS_RUN_VALUE)
+            except FileNotFoundError:
+                pass
+        else:
+            winreg.SetValueEx(key, WINDOWS_RUN_VALUE, 0, winreg.REG_SZ, subprocess.list2cmdline(command))
+
+
+def windows_autostart_command() -> str:
+    if not WINDOWS:
+        return ""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WINDOWS_RUN_KEY) as key:
+            return str(winreg.QueryValueEx(key, WINDOWS_RUN_VALUE)[0])
+    except OSError:
+        return ""
+
+
+def _windows_restart(home: Path) -> bool:
+    """서비스로 도는 에이전트를 다시 시작한다. 돌고 있지 않으면 지금 띄운다."""
+    if agent_running(home):
+        (home / RESTART_REQUEST).write_text("")
+        return True
+    _take_request(home / RESTART_REQUEST)
+    if start_background_agent(home):
+        return True
+    print("에이전트를 띄우지 못했습니다. 직접 실행: " + subprocess.list2cmdline(windows_service_command(home)))
+    return False
+
+
+def _windows_stop(home: Path) -> None:
+    if not agent_running(home):
+        return
+    (home / STOP_REQUEST).write_text("")
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and agent_running(home):
+        time.sleep(0.5)
+
+
+def _read_log_from(path: Path, offset: int) -> str:
+    try:
+        with open(path, "rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(offset if offset <= size else 0)      # 그사이 로그를 새로 시작했으면 처음부터
+            return handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _windows_service_check(home: Path, offset: int) -> None:
+    """띄운 에이전트가 실제로 시작했는지 로그로 확인한다. 시작할 때 인코더를 다시 시험하므로 1분쯤
+    걸릴 수 있다."""
+    log_path = home / AGENT_LOG
+    print("서비스 시작을 확인하는 중입니다(인코더 시험에 1분쯤 걸릴 수 있습니다)...")
+    deadline = time.monotonic() + 120
+    tail = ""
+    while time.monotonic() < deadline:
+        time.sleep(1)
+        tail = _read_log_from(log_path, offset)
+        if "에이전트 %s 시작" % __version__ in tail:
+            print("서비스 동작 확인됨")
+            return
+        if "오류:" in tail or "Traceback" in tail or "이미 돌고 있습니다" in tail:
+            break
+    lines = [line for line in tail.strip().splitlines() if line.strip()]
+    print("서비스가 아직 돌지 않습니다. 로그를 확인하세요: %s" % log_path)
+    for line in lines[-5:]:
+        print("  " + line)
 
 
 def command_status(args) -> int:
@@ -3384,6 +3831,10 @@ def command_status(args) -> int:
         print("  서버     : %s — 러너 %s (#%s)" % (entry.get("url"), entry.get("name"), entry.get("runner_id")))
     slots = max(1, int(config.data["slots"])) if config.data.get("slots") else recommended_slots(caps)
     _describe(caps, config.data["ffmpeg"], slots, config.tmp_dir, usable_rclone_remotes(config.data))
+    if WINDOWS:
+        print("  서비스   : %s, %s (로그: %s)" % (
+            "시작 프로그램에 등록됨" if windows_autostart_command() else "등록 안 됨",
+            "실행 중" if agent_running(config.home) else "멈춤", config.home / AGENT_LOG))
     return 0
 
 
@@ -3400,7 +3851,7 @@ def command_remove_server(args) -> int:
     config.data["servers"] = remaining
     config.save()
     print("이 서버와의 연결을 지웠습니다: %s (그 서버의 러너 목록에서도 삭제하세요)" % target)
-    _restart_service()
+    _restart_service(config.home)
     return 0
 
 
@@ -3417,7 +3868,7 @@ def command_configure(args) -> int:
     print("저장했습니다.")
     print("  rclone   : %s" % (", ".join(usable_rclone_remotes(config.data)) or "쓰지 않음"))
     print("  총 슬롯  : %s" % (config.data.get("slots") or "추천값"))
-    _restart_service()
+    _restart_service(config.home)
     return 0
 
 
@@ -3432,7 +3883,7 @@ def command_update(args) -> int:
         raise AgentError("받은 파일이 에이전트가 아닙니다: " + SOURCE_URL)
     os.replace(str(staged), str(current))
     print("%s → %s" % (__version__, version.split()[-1]))
-    _restart_service()
+    _restart_service(Path(args.dir).expanduser().resolve())
     return 0
 
 
@@ -3451,12 +3902,15 @@ def _systemctl(*arguments) -> int:
     return subprocess.call(["systemctl", *scope, *arguments])
 
 
-def _restart_service() -> None:
+def _restart_service(home: Path) -> None:
     system = platform.system()
     if system == "Darwin" and _launch_agent_path().is_file():
         subprocess.call(["launchctl", "kickstart", "-k", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)])
     elif system == "Linux" and _systemd_unit_path().is_file():
         _systemctl("restart", SYSTEMD_UNIT)
+    elif system == "Windows" and windows_autostart_command():
+        if _windows_restart(home):
+            print("에이전트를 다시 시작합니다(몇 초 걸립니다). 로그: %s" % (home / AGENT_LOG))
     else:
         print("실행 중인 에이전트를 다시 시작하세요.")
 
@@ -3571,6 +4025,24 @@ def command_service(args) -> int:
         else:
             print("systemctl 등록 실패 — 직접 실행: " + " ".join(command))
         return code
+    if system == "Windows":
+        if args.action == "uninstall":
+            _windows_autostart(None)
+            _windows_stop(home)
+            print("서비스 제거됨")
+            return 0
+        _windows_autostart(windows_service_command(home))
+        print("서비스 등록됨(로그인하면 자동 시작): 시작 프로그램 '%s'" % WINDOWS_RUN_VALUE)
+        log_path = home / AGENT_LOG
+        try:
+            offset = log_path.stat().st_size
+        except OSError:
+            offset = 0
+        if not _windows_restart(home):
+            return 1
+        print("로그: %s" % log_path)
+        _windows_service_check(home, offset)
+        return 0
     if args.action == "install":
         print("이 플랫폼은 서비스 자동 등록을 지원하지 않습니다. 직접 실행하세요:\n  " + " ".join(command))
     return 0
@@ -3624,7 +4096,10 @@ def main(argv=None) -> int:
     install.add_argument("--no-service", action="store_true", help="서비스로 등록하지 않음")
     install.add_argument("--force", action="store_true", help="이미 등록한 서버에 다시 등록")
     install.set_defaults(handler=command_install)
-    with_dir("run", "작업을 받아 실행").set_defaults(handler=command_run)
+    run = with_dir("run", "작업을 받아 실행")
+    # 서비스(Windows 시작 프로그램)가 쓰는 실행 방식: 출력은 <폴더>/agent.log, 다른 명령의 요청을 따른다.
+    run.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
+    run.set_defaults(handler=command_run)
     with_dir("status", "이 기기의 인코더·설정 표시").set_defaults(handler=command_status)
     with_dir("update", "공개 저장소에서 새 에이전트 받기").set_defaults(handler=command_update)
     configure = with_dir("configure", "이 기기의 설정 바꾸기(rclone 리모트·작업 상한)")

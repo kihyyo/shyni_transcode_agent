@@ -1,8 +1,9 @@
 # Shyni 트랜스코딩 에이전트
 
-Turns a machine with a hardware video encoder (an Apple Silicon Mac, an Intel or NVIDIA
-box) into a remote transcoding worker for a Shyni media server, in the style of a GitHub
-self-hosted runner. One Python file, standard library only.
+Turns a machine with a hardware video encoder (an Apple Silicon Mac, a Linux box, or a
+Windows PC with an NVIDIA, AMD or Intel GPU) into a remote transcoding worker for a Shyni
+media server, in the style of a GitHub self-hosted runner. One Python file, standard
+library only. The installer detects the OS and GPU and picks the encoder itself.
 
 H/W 인코더가 없는 서버(OCI 같은 클라우드 서버)에서 Shyni 를 돌릴 때, 변환이 필요한 재생을
 H/W 가 있는 다른 기기에 맡기는 에이전트입니다.
@@ -25,12 +26,13 @@ H/W 가 있는 다른 기기에 맡기는 에이전트입니다.
 
 ## 필요한 것
 
-- macOS 또는 Linux, Python 3.9 이상, `curl`
-- 트랜스코더 메뉴(설정 → 관리 → 트랜스코더)가 있는 Shyni 서버
+- macOS, Linux 또는 Windows 10·11
+- Python 3.9 이상. Windows 는 없으면 설치 명령이 winget 으로 이 사용자에게만 설치합니다(관리자
+  권한 불필요). macOS·Linux 는 `curl` 도 필요합니다.
+- 트랜스코더 메뉴(설정 → 관리 → 트랜스코더)가 있는 Shyni 서버. 관리자 화면의 Windows 설치 명령과
+  AMD(AMF) 인코더는 서버도 이를 아는 버전이어야 합니다 — 이전 서버는 AMF 러너를 "인코더 없음"으로
+  봅니다(NVIDIA·Intel 러너는 이전 서버에서도 됩니다).
 - 이 기기에서 Shyni 서버 주소로 나가는 연결. 외부에 있는 서버라면 https 주소
-
-Windows 는 `run` 을 직접 실행하면 동작하도록 만들었지만 시험하지 않았고, 설치 스크립트와
-자동 시작은 지원하지 않습니다.
 
 ## 리버스 프록시
 
@@ -110,24 +112,42 @@ rclone lsf "gds:{서버 마운트 관리의 루트 폴더 ID}" --max-depth 1
 
 ## 설치
 
-Shyni 관리자 화면의 **설정 → 관리 → 트랜스코더 → 러너 추가**에서 "설치 명령 만들기"를 누르면
-아래와 같은 명령이 나옵니다. 러너로 쓸 기기에서 실행합니다.
+Shyni 관리자 화면의 **설정 → 관리 → 트랜스코더 → 러너 추가**에서 "설치 명령 만들기"를 누르고,
+러너로 쓸 기기의 OS(macOS · Linux / Windows)를 고르면 그 기기에서 실행할 명령이 나옵니다. 기본은
+그 화면을 연 브라우저의 OS 입니다.
+
+macOS · Linux (터미널):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kihyyo/shyni_transcode_agent/main/install.sh | sh -s -- \
   --url https://shyni.example --token shr_xxxxxxxx --dir "$HOME/shyni-transcoder"
 ```
 
+Windows (PowerShell, 관리자 권한 불필요):
+
+```powershell
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/kihyyo/shyni_transcode_agent/main/install.ps1'))) --url 'https://shyni.example' --token 'shr_xxxxxxxx' --dir "$HOME\shyni-transcoder"
+```
+
+Windows 의 Git Bash 에서는 macOS · Linux 명령도 됩니다(경로를 Windows 형식으로 바꿔 넘깁니다).
+저장소를 받아 둔 경우 `sh install.sh …`, `powershell -ExecutionPolicy Bypass -File install.ps1 …` 로도
+실행할 수 있습니다.
+
 토큰은 한 번만 쓸 수 있고 1시간 뒤 만료됩니다. 설치가 하는 일:
 
-1. 에이전트 파일을 `<폴더>/agent/` 에 받습니다.
-2. 쓸 ffmpeg 를 고릅니다. 이 기기에 이미 있는 ffmpeg 로 H/W 인코딩이 되면 그것을 쓰고,
+1. Python 을 찾고(Windows 는 없으면 winget 으로 설치) 에이전트 파일을 `<폴더>/agent/` 에 받습니다.
+2. 이 기기의 OS 와 GPU 를 봅니다. Windows 는 레지스트리의 그래픽 카드 목록으로 NVIDIA → AMD → Intel
+   (외장 그래픽 먼저) 순으로 시험할 인코더를 정하고, Linux 는 `/dev/nvidia*`·`/dev/dri` 장치를,
+   macOS 는 VideoToolbox 를 봅니다.
+3. 쓸 ffmpeg 를 고릅니다. 이 기기에 이미 있는 ffmpeg 로 H/W 인코딩이 되면 그것을 쓰고,
    안 되면 이 기기 종류에 맞는 [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg)
    휴대용 빌드를 `<폴더>/ffmpeg/` 에 받습니다(버전과 SHA-256 을 고정해 확인).
-3. 인코더 목록을 믿지 않고 실제 프레임을 인코딩해 봅니다. 통과한 H/W 인코더만 쓰고,
+4. 인코더 목록을 믿지 않고 실제 프레임을 인코딩해 봅니다. 통과한 H/W 인코더만 쓰고,
    없으면 libx264(S/W)로 등록합니다. H.265·AV1 인코더도 같이 시험합니다.
-4. 서버에 등록하고 자격을 `<폴더>/config.json`(소유자만 읽기)에 저장합니다.
-5. 로그인하면 자동으로 시작하도록 서비스로 등록합니다(macOS LaunchAgent, Linux systemd).
+5. 서버에 등록하고 자격을 `<폴더>/config.json`(소유자만 읽기)에 저장합니다.
+6. 로그인하면 자동으로 시작하도록 서비스로 등록하고 바로 띄웁니다(macOS LaunchAgent, Linux systemd,
+   Windows 는 현재 사용자의 시작 프로그램에 콘솔 창 없이 도는 `pythonw` 로 등록). Windows 는 설치한
+   PowerShell 창을 닫아도 계속 돕니다.
 
 | 옵션 | 뜻 |
 |---|---|
@@ -137,7 +157,7 @@ curl -fsSL https://raw.githubusercontent.com/kihyyo/shyni_transcode_agent/main/i
 | `--tmp` | 변환 임시 폴더 (기본 `<폴더>/tmp`). 여유 공간이 넉넉한 디스크를 지정 |
 | `--name` | 관리자 화면에 보일 러너 이름 (기본 호스트 이름) |
 | `--slots` | 이 기기의 총 동시 작업 수 (기본 추천값). 붙어 있는 서버를 모두 합친 한도입니다 |
-| `--encoder` | `auto`(기본) · `software` · `nvenc` · `vaapi` · `qsv` · `videotoolbox` |
+| `--encoder` | `auto`(기본) · `software` · `nvenc` · `vaapi` · `qsv` · `amf` · `videotoolbox` |
 | `--ffmpeg` | 쓸 ffmpeg 경로를 직접 지정 (자동 선택·내려받기 생략) |
 | `--rclone-remote` | 이 기기의 rclone 으로 직접 읽을 리모트 이름 (위 "rclone 으로 원본 직접 읽기") |
 | `--rclone`, `--rclone-config` | rclone 실행 파일과 설정 파일 위치 (기본값이 아닐 때) |
@@ -184,6 +204,11 @@ python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py remove-server --url ht
 | Apple Silicon / Intel Mac | VideoToolbox | H.264, H.265 | VideoToolbox | 없음 |
 | NVIDIA (Linux, Windows) | NVENC | H.264, H.265, AV1(RTX 40 계열부터) | CUDA | NVIDIA 드라이버 |
 | Intel / AMD (Linux) | VAAPI, QSV | H.264, H.265, AV1(지원하는 GPU) | VAAPI(VAAPI 인코더와 함께일 때) | `/dev/dri` 접근 권한(`render` 그룹), VAAPI 드라이버 |
+| AMD (Windows) | AMF | H.264, H.265, AV1(RX 7000 계열부터) | 없음(CPU) | AMD Adrenalin 드라이버 |
+| Intel (Windows) | QSV | H.264, H.265, AV1(Arc·Core Ultra 부터) | 없음(CPU) | Intel 그래픽 드라이버 |
+
+Windows 에서 외장 그래픽과 내장 그래픽이 같이 있으면 외장(NVIDIA·AMD)을 먼저 시험합니다. 원격 데스크톱
+(RDP)으로 접속한 세션에서는 GPU 를 못 쓸 수 있습니다 — 그때는 기기 앞에서 로그인한 세션에서 돌리세요.
 
 GPU 드라이버는 설치하지 않습니다(관리자 권한과 커널에 맞는 버전이 필요합니다). 드라이버를
 갖춘 뒤 에이전트를 다시 시작하면 인코더를 다시 시험합니다.
@@ -208,7 +233,8 @@ GPU 드라이버는 설치하지 않습니다(관리자 권한과 커널에 맞�
 - 720p 이하로 변환할 때 원본 오디오가 무거우면(480p 는 300 kbps, 720p 는 400 kbps 이상) 서버가
   AAC 2.0 128 kbps 로 낮추라고 보냅니다.
 - macOS(VideoToolbox H.265)와 Linux Intel VAAPI(H.265)에서 확인했습니다. NVENC 의 H.265·AV1 과
-  QSV, Windows 의 NVENC AV1 은 시험하지 못했습니다. 시험을 통과하지 못한 코덱은 쓰지 않으므로
+  QSV, Windows 의 NVENC AV1 과 AMD AMF 는 시험하지 못했습니다. AMF 는 품질 고정 대신 비트레이트
+  상한 모드(`-rc vbr_peak`)로 변환합니다. 시험을 통과하지 못한 코덱은 쓰지 않으므로
   H.264 변환에는 영향이 없습니다.
 - H.265·AV1 은 서버와 에이전트가 모두 0.4 이상일 때 씁니다. 한쪽이 그보다 낮으면 H.264 로
   변환합니다.
@@ -231,8 +257,14 @@ python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py update      # 새 버�
 python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py uninstall   # 서비스·등록 정보 제거
 ```
 
+Windows(PowerShell)는 `python3` 대신 `py`, 경로는 `"$HOME\shyni-transcoder\agent\shyni_transcode_agent.py"`
+입니다(예: `py "$HOME\shyni-transcoder\agent\shyni_transcode_agent.py" status`).
+
 로그는 서비스로 돌 때 macOS 는 `~/Library/Logs/shyni-transcode-agent.log`, Linux 는
-`journalctl --user -u shyni-transcode-agent` 에 쌓입니다. 사용 여부와 최대 슬롯, 삭제는 Shyni 관리자 화면에서 합니다.
+`journalctl --user -u shyni-transcode-agent`, Windows 는 `<폴더>\agent.log`(10MB 를 넘으면
+`agent.log.1` 로 넘김)에 쌓입니다. 한 폴더의 에이전트는 하나만 돕니다 — 서비스가 돌고 있으면
+`run` 을 직접 실행해도 "이미 돌고 있습니다"로 끝납니다. Windows 에서 `configure`·`update`·
+`remove-server` 를 실행하면 돌고 있는 에이전트가 몇 초 안에 스스로 다시 시작합니다. 사용 여부와 최대 슬롯, 삭제는 Shyni 관리자 화면에서 합니다.
 에이전트는 스스로 갱신하지 않습니다. 서버가 "에이전트 업데이트 필요"로 표시하면 이 기기에서
 `update` 를 실행하세요.
 
@@ -293,6 +325,14 @@ python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py uninstall   # 서비�
   python3 경로를 추가한 뒤 `service install` 을 다시 실행하거나, `--dir`·`--tmp` 를 내장 디스크로
   두세요. 임시 폴더에는 아직 서버로 올리지 않은 조각만 남아 내장 디스크로도 충분합니다.
   설치 직후 "Python 이 이동식 볼륨의 파일에 접근하려고 합니다" 창이 뜨면 허용해도 됩니다.
+
+- **Windows 에서 "S/W 로 등록됨"** — `status` 의 GPU 이름과 인코더를 확인하세요. 그래픽 드라이버를
+  최신으로 올리고(NVIDIA·AMD Adrenalin·Intel), 원격 데스크톱 세션이 아닌 곳에서 `service install` 을
+  다시 실행하면 인코더를 다시 시험합니다.
+- **Windows 에서 로그인해야만 돕니다** — 시작 프로그램으로 등록하므로 그 사용자가 로그인해 있는 동안
+  돕니다(macOS·Linux 의 사용자 서비스와 같습니다). 자동 로그인을 켜 두면 재부팅 뒤에도 붙습니다.
+- **Windows 백신이 pythonw 나 ffmpeg 를 막을 때** — `<폴더>` 를 검사 예외에 넣으세요. 막히면
+  `agent.log` 에 ffmpeg 시작 실패가 남습니다.
 
 ## 개발
 

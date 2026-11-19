@@ -10,6 +10,7 @@ import tempfile
 import time
 import threading
 import unittest
+from unittest import mock
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -138,7 +139,7 @@ class UploadLimitTests(unittest.TestCase):
 
     def test_server_refusal_keeps_the_server_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
-            job = self.job(RejectingApi(b'{"detail":"\ud30c\uc77c\uc774 \ub108\ubb34 \ud07d\ub2c8\ub2e4"}'), tmp)
+            job = self.job(RejectingApi(rb'{"detail":"\ud30c\uc77c\uc774 \ub108\ubb34 \ud07d\ub2c8\ub2e4"}'), tmp)
             with self.assertRaises(agent.UploadTooLarge) as error:
                 job._upload("seg00000.ts")
             self.assertIn("파일이 너무 큽니다", str(error.exception))
@@ -1229,7 +1230,7 @@ class ServerListTests(unittest.TestCase):
         agent.Api, RegisterApi.registered = RegisterApi, []
         agent.choose_ffmpeg = lambda config, explicit: ("/opt/ffmpeg", dict(CAPS))
         agent.machine_info = lambda: {"os": "test"}
-        agent._restart_service = lambda: None
+        agent._restart_service = lambda *_args: None
         self.stdout, self.stderr = sys.stdout, sys.stderr
         sys.stdout = sys.stderr = open(os.devnull, "w")
 
@@ -1278,6 +1279,190 @@ class ServerListTests(unittest.TestCase):
             {"url": "https://one.example", "token": "old", "runner_id": 4, "name": "box"}])
         self.assertEqual((config.data["ffmpeg"], str(config.tmp_dir)), ("/opt/ffmpeg", "/work"))
         self.assertNotIn("token", config.data)
+
+
+class WindowsSupportTests(unittest.TestCase):
+    """Windows 경로는 이 OS 의 API 를 바꿔 끼워 리눅스·macOS 에서도 시험한다."""
+
+    def test_encoders_follow_the_gpus_found_in_the_registry(self):
+        cases = (
+            ([("nvidia", "NVIDIA GeForce RTX 4070"), ("intel", "Intel(R) UHD Graphics 770")],
+             ("h264_nvenc", "h264_qsv")),
+            ([("intel", "Intel(R) UHD Graphics"), ("amd", "AMD Radeon RX 7800 XT")], ("h264_amf", "h264_qsv")),
+            ([("intel", "Intel(R) Arc(TM) A380")], ("h264_qsv",)),
+            ([("", "Microsoft Basic Display Adapter")], ("h264_nvenc", "h264_amf", "h264_qsv")),
+            ([], ("h264_nvenc", "h264_amf", "h264_qsv")),
+        )
+        with mock.patch.object(agent.platform, "system", return_value="Windows"):
+            for gpus, expected in cases:
+                with mock.patch.object(agent, "windows_gpus", return_value=gpus):
+                    self.assertEqual(agent._ordered_hw_encoder_candidates("auto"), expected)
+                    # CUDA 디코딩은 NVIDIA 가 있거나 GPU 를 읽지 못했을 때만 시험한다.
+                    self.assertEqual(bool(agent._hw_decode_candidates({})), expected[0] == "h264_nvenc")
+                    self.assertEqual(agent._ordered_hw_encoder_candidates("h264_amf"), ("h264_amf",))
+
+    def test_amf_output_is_8_bit_with_a_bitrate_ceiling(self):
+        for encoder, codec in (("h264_amf", "h264"), ("hevc_amf", "hevc"), ("av1_amf", "av1")):
+            args = agent.build_transcode_args(
+                "ffmpeg", "http://127.0.0.1:1/media", "video", max_height=720, hdr=False,
+                video_encoder=encoder, output_codec=codec)
+            self.assertIn("format=nv12", args[args.index("-vf") + 1])
+            self.assertEqual(args[args.index("-c:v") + 1:args.index("-c:v") + 6],
+                             [encoder, "-quality", "balanced", "-rc", "vbr_peak"])
+            self.assertEqual(args[args.index("-maxrate") + 1], args[args.index("-b:v") + 1])
+        self.assertEqual(agent.ENCODER_ALIASES["amf"], "h264_amf")
+
+    def test_pause_freezes_ffmpeg_once_per_change(self):
+        calls = []
+        job = SimpleNamespace(proc=SimpleNamespace(pid=4242, poll=lambda: None), _suspended=False)
+        with mock.patch.object(agent, "WINDOWS", True), \
+                mock.patch.object(agent, "windows_suspend", side_effect=lambda pid, on: calls.append((pid, on)) or True):
+            for paused in (True, True, False, False, True):
+                agent.Job.pause(job, paused)
+        self.assertEqual(calls, [(4242, True), (4242, False), (4242, True)])
+        self.assertTrue(job._suspended)
+
+    def test_cpu_time_is_measured_through_the_process_handle(self):
+        closed = []
+        api = {"kernel32": SimpleNamespace(CloseHandle=closed.append)}
+        with mock.patch.object(agent, "WINDOWS", True), \
+                mock.patch.object(agent, "_windows_open_process", return_value=77), \
+                mock.patch.object(agent, "windows_cpu_seconds", return_value=1.25), \
+                mock.patch.object(agent, "_windows_api", return_value=api):
+            code, wall, cpu = agent._measure_ffmpeg([sys.executable, "-c", "pass"], None)
+        self.assertEqual((code, cpu, closed), (0, 1.25, [77]))
+        self.assertGreater(wall, 0)
+
+    def test_the_service_runs_windowless_from_the_agent_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            python = Path(tmp, "python.exe")
+            python.write_text("")
+            with mock.patch.object(agent.sys, "executable", str(python)):
+                home = Path(tmp, "runner")
+                self.assertEqual(agent.windows_service_command(home)[0], str(python))
+                Path(tmp, "pythonw.exe").write_text("")
+                command = agent.windows_service_command(home)
+        self.assertEqual(command[0], str(Path(tmp, "pythonw.exe")))
+        self.assertEqual(command[2:], ["run", "--dir", str(home), "--background"])
+        self.assertTrue(command[1].endswith("shyni_transcode_agent.py"))
+
+    def test_only_one_agent_runs_per_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertFalse(agent.agent_running(home))
+            first = agent.acquire_instance_lock(home)
+            self.assertIsNotNone(first)
+            started = time.monotonic()
+            self.assertIsNone(agent.acquire_instance_lock(home, wait=0.6))
+            self.assertGreaterEqual(time.monotonic() - started, 0.5)
+            self.assertTrue(agent.agent_running(home))
+            agent.release_instance_lock(first)
+            self.assertFalse(agent.agent_running(home))
+
+    @unittest.skipIf(os.name == "nt", "POSIX flock")
+    def test_a_folder_that_cannot_be_locked_still_runs_the_agent(self):
+        # NFS without a lock daemon and some FUSE mounts refuse flock outright. That is not another
+        # agent holding the folder, so the agent must start rather than wait and give up.
+        import errno
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                fcntl, "flock", side_effect=OSError(errno.ENOLCK, "No locks available")):
+            started = time.monotonic()
+            handle = agent.acquire_instance_lock(Path(tmp), wait=5)
+            self.assertIsNotNone(handle)
+            self.assertLess(time.monotonic() - started, 1)
+            agent.release_instance_lock(handle)
+
+    def test_other_commands_restart_or_stop_the_service_through_request_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "config.json").write_text("{}")
+            runner = SimpleNamespace(running=True, restart_requested=False)
+            (home / agent.RESTART_REQUEST).write_text("")
+            agent._watch_requests(runner, home)
+            self.assertTrue(runner.restart_requested)
+            self.assertFalse((home / agent.RESTART_REQUEST).exists())
+            runner = SimpleNamespace(running=True, restart_requested=False)
+            (home / "config.json").unlink()          # uninstall 이 등록 정보를 지웠다
+            agent._watch_requests(runner, home)
+            self.assertFalse(runner.running or runner.restart_requested)
+
+    def test_background_output_goes_to_a_rotated_log(self):
+        saved = sys.stdout, sys.stderr
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / agent.AGENT_LOG).write_text("x" * 64)
+            try:
+                with mock.patch.object(agent, "AGENT_LOG_ROTATE_BYTES", 10):
+                    agent._redirect_output_to_log(home)
+                agent.log("에이전트 시작")
+            finally:
+                sys.stdout.close()
+                sys.stdout, sys.stderr = saved
+            self.assertEqual((home / (agent.AGENT_LOG + ".1")).read_text(), "x" * 64)
+            self.assertIn("에이전트 시작", (home / agent.AGENT_LOG).read_text(encoding="utf-8"))
+
+    def test_service_check_reads_only_what_the_new_agent_wrote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, agent.AGENT_LOG)
+            path.write_text("old run\n", encoding="utf-8")
+            offset = path.stat().st_size
+            with open(path, "a", encoding="utf-8") as out:
+                out.write("에이전트 %s 시작: 서버=…\n" % agent.__version__)
+            self.assertEqual(agent._read_log_from(path, offset), "에이전트 %s 시작: 서버=…\n" % agent.__version__)
+            path.write_text("new\n", encoding="utf-8")       # 로그를 새로 시작해 offset 보다 짧다
+            self.assertEqual(agent._read_log_from(path, offset), "new\n")
+
+
+class InstallScriptTests(unittest.TestCase):
+    """install.sh 가 OS 를 보고 Python 과 경로를 고르는지 — uname·cygpath·python 을 바꿔 끼워 본다."""
+
+    def _run(self, uname: str):
+        import shutil
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp, "bin")
+            fake.mkdir()
+            record = Path(tmp, "args.txt")
+            scripts = {
+                "uname": "#!/bin/sh\necho %s\n" % uname,
+                "cygpath": "#!/bin/sh\nprintf 'W:%s\\n' \"$2\"\n",
+                # Windows 용 Python 인지 묻는 검사를 통과하고, 실행되면 받은 인자를 적는다.
+                "python": "#!/bin/sh\n[ \"$1\" = -c ] && exit 0\nprintf '%%s\\n' \"$@\" > %s\n" % record,
+            }
+            for name, body in scripts.items():
+                Path(fake, name).write_text(body)
+                Path(fake, name).chmod(0o755)
+            script_dir = Path(tmp, "repo")
+            script_dir.mkdir()
+            here = Path(__file__).resolve().parent
+            for name in ("install.sh", "shyni_transcode_agent.py"):
+                shutil.copy(here / name, script_dir / name)
+            home = Path(tmp, "home")
+            env = {**os.environ, "PATH": "%s:%s" % (fake, os.environ["PATH"]), "HOME": str(home)}
+            env.pop("PYTHON", None)
+            if uname.startswith("Linux"):
+                env["PYTHON"] = str(fake / "python")
+            subprocess.run(["sh", str(script_dir / "install.sh"), "--url", "https://shyni.example",
+                            "--token", "shr_x", "--tmp", "/d/scratch"], env=env, check=True, timeout=30)
+            self.assertTrue((home / "shyni-transcoder" / "agent" / "shyni_transcode_agent.py").is_file())
+            return record.read_text().splitlines(), home
+
+    def test_git_bash_on_windows_hands_windows_paths_to_windows_python(self):
+        args, home = self._run("MINGW64_NT-10.0-22631")
+        folder = home / "shyni-transcoder"
+        self.assertEqual(args, [
+            "W:%s" % (folder / "agent" / "shyni_transcode_agent.py"), "install", "--dir", "W:%s" % folder,
+            "--url", "https://shyni.example", "--token", "shr_x", "--tmp", "W:/d/scratch",
+        ])
+
+    def test_linux_passes_paths_through(self):
+        args, home = self._run("Linux")
+        folder = home / "shyni-transcoder"
+        self.assertEqual(args, [
+            str(folder / "agent" / "shyni_transcode_agent.py"), "install", "--dir", str(folder),
+            "--url", "https://shyni.example", "--token", "shr_x", "--tmp", "/d/scratch",
+        ])
 
 
 if __name__ == "__main__":

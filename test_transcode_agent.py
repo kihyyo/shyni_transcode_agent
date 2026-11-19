@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import threading
 import unittest
 import urllib.parse
@@ -38,10 +39,21 @@ class SpecTests(unittest.TestCase):
             "source": "embedded", "stream_index": 3, "lang_code": None, "title": None,
         })
 
+    def test_output_codec_and_audio_bitrate_are_known_values_only(self):
+        old_server = agent.clean_spec({"mode": "video"})          # a server from before 0.4
+        self.assertEqual((old_server["output_codec"], old_server["audio_bitrate_kbps"]), ("h264", None))
+        for codec in ("h264", "hevc", "av1"):
+            self.assertEqual(agent.clean_spec({"mode": "video", "output_codec": codec})["output_codec"], codec)
+        for value, expected in ((128, 128), ("96", 96), (32, 32), (640, 640), (31, None), (9999, None),
+                                ("128k; rm -rf /", None), (True, None), (None, None)):
+            spec = agent.clean_spec({"mode": "video", "audio_bitrate_kbps": value})
+            self.assertEqual(spec["audio_bitrate_kbps"], expected, value)
+
     def test_unknown_modes_formats_and_subtitles_are_rejected(self):
         for raw in (
             {"mode": "shell"}, {"mode": "video", "segment_format": "webm"},
             {"mode": "music", "music_bitrate_kbps": 96},
+            {"mode": "video", "output_codec": "vp9"}, {"mode": "video", "output_codec": "hevc_nvenc -y /etc/passwd"},
             {"mode": "video", "subtitle": {"source": "file"}},
             {"mode": "video", "subtitle": {"source": "embedded"}}, None,
         ):
@@ -215,8 +227,11 @@ class Upstream:
                 ranged = self.headers.get("Range")
                 if ranged:
                     first, _, last = ranged.split("=")[1].partition("-")
-                    start = int(first)
-                    end = int(last) if last else end
+                    if first:
+                        start = int(first)
+                        end = int(last) if last else end
+                    else:                                   # suffix range: the last N bytes
+                        start = max(0, len(upstream.data) - int(last))
                 body = upstream.data[start:end + 1]
                 self.send_response(206 if ranged else 200)
                 self.send_header("Content-Length", str(len(body)))
@@ -314,29 +329,154 @@ class SourceProxyTests(unittest.TestCase):
         self.assertEqual(self.upstream.seen[1][1], "bytes=300000-")
 
 
+class PrefetchTests(unittest.TestCase):
+    """The head and tail of a source are fetched in parallel when a job starts and shared with
+    later jobs on the same file: FFmpeg's open/probe/seek made six sequential 1-2 s requests."""
+
+    def setUp(self):
+        self.upstream = Upstream(bytes(range(256)) * 4000)      # ~1 MB
+        self.upstream.token = "t"
+        self.api = SimpleNamespace(base_url="http://server", token="runner", host="127.0.0.1")
+        self.proxy = agent.SourceProxy(self.api)
+        self._sizes = agent.SOURCE_HEAD_BYTES, agent.SOURCE_TAIL_BYTES
+        agent.SOURCE_HEAD_BYTES, agent.SOURCE_TAIL_BYTES = 4096, 8192
+        agent.time.sleep, self._sleep = (lambda seconds: None), agent.time.sleep
+
+    def tearDown(self):
+        agent.SOURCE_HEAD_BYTES, agent.SOURCE_TAIL_BYTES = self._sizes
+        agent.time.sleep = self._sleep
+        self.proxy.server.shutdown()
+        self.upstream.server.shutdown()
+
+    def job(self, job_id=JOB_ID, part_id=7):
+        job = SimpleNamespace(
+            id=job_id, nonce="n" * 32, stopped=threading.Event(), part_id=part_id, cache=None, api=self.api,
+            source={"kind": "url", "url": self.upstream.url, "headers": {"Authorization": "Bearer t"}},
+        )
+        self.proxy.jobs[job_id] = job
+        return job
+
+    def fetch(self, job, ranged):
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.port, timeout=10)
+        conn.request("GET", urllib.parse.urlsplit(self.proxy.url_for(job, "media")).path,
+                     headers={"Range": ranged})
+        response = conn.getresponse()
+        body = response.read()
+        conn.close()
+        return response.status, response.headers, body
+
+    def wait_prefetched(self, job):
+        self.assertTrue(job.cache.idle(5))
+
+    def test_head_and_tail_are_served_from_the_prefetch(self):
+        data, size = self.upstream.data, len(self.upstream.data)
+        job = self.job()
+        self.proxy.prefetch(job)
+        self.wait_prefetched(job)
+        self.assertEqual(sorted(r for _, r in self.upstream.seen), ["bytes=-8192", "bytes=0-4095"])
+        status, headers, body = self.fetch(job, "bytes=100-999")
+        self.assertEqual((status, body), (206, data[100:1000]))
+        self.assertEqual(headers["Content-Range"], "bytes 100-999/%d" % size)
+        status, headers, body = self.fetch(job, "bytes=%d-" % (size - 5000))
+        self.assertEqual((status, body), (206, data[size - 5000:]))
+        self.assertEqual(headers["Connection"], "close")
+        self.assertEqual(len(self.upstream.seen), 2)              # nothing more from the cloud
+
+    def test_reading_past_the_head_continues_from_the_source(self):
+        job = self.job()
+        self.proxy.prefetch(job)
+        self.wait_prefetched(job)
+        status, headers, body = self.fetch(job, "bytes=100-")
+        self.assertEqual((status, body), (206, self.upstream.data[100:]))
+        self.assertEqual(headers["Content-Length"], str(len(self.upstream.data) - 100))
+        self.assertEqual(self.upstream.seen[-1][1], "bytes=4096-")
+        # The middle of the file is not cached.
+        status, _, body = self.fetch(job, "bytes=500000-500099")
+        self.assertEqual(body, self.upstream.data[500000:500100])
+        self.assertEqual(self.upstream.seen[-1][1], "bytes=500000-500099")
+
+    def test_a_later_job_on_the_same_file_reuses_it(self):
+        first = self.job()
+        self.proxy.prefetch(first)
+        self.wait_prefetched(first)
+        second = self.job("b" * 32, part_id=7)
+        self.proxy.prefetch(second)
+        self.assertIs(second.cache, first.cache)
+        self.assertEqual(self.fetch(second, "bytes=0-99")[2], self.upstream.data[:100])
+        self.assertEqual(len(self.upstream.seen), 2)
+        other = self.job("c" * 32, part_id=8)                       # another file
+        self.proxy.prefetch(other)
+        self.assertIsNot(other.cache, first.cache)
+
+    def test_a_failed_prefetch_leaves_reading_to_the_source(self):
+        self.upstream.token = "other"                                # the prefetch is refused
+        job = self.job()
+        self.proxy.prefetch(job)
+        self.wait_prefetched(job)
+        self.assertTrue(job.cache.failed)
+        self.upstream.token = "t"
+        status, _, body = self.fetch(job, "bytes=0-99")
+        self.assertEqual((status, body), (206, self.upstream.data[:100]))
+        self.proxy.prefetch(job)                                      # a new job tries again
+        self.wait_prefetched(job)
+        self.assertFalse(job.cache.failed)
+
+    def test_a_warm_command_prefetches_before_any_job(self):
+        link = SimpleNamespace(api=self.api)
+        self.proxy.warm(link, {"part_id": 7, "source": {
+            "kind": "url", "url": self.upstream.url, "headers": {"Authorization": "Bearer t"}}})
+        job = self.job()
+        self.proxy.prefetch(job)
+        self.wait_prefetched(job)
+        self.assertEqual(self.fetch(job, "bytes=0-99")[2], self.upstream.data[:100])
+        self.assertEqual(len(self.upstream.seen), 2)                  # only the warm command's two
+        self.proxy.warm(link, {"part_id": 9, "source": {"kind": "server"}})
+        self.assertEqual(len(self.upstream.seen), 2)
+
+
 FAKE_RCLONE = '''#!%s
-"""Stands in for rclone: `listremotes`, and `serve http <remote>:{id} --addr host:port`."""
-import base64, http.server, os, sys, urllib.parse
+"""Stands in for rclone: `listremotes`, and `rcd --rc-serve --rc-addr host:port` serving
+`/[<remote>:{id}]/<path>` the way rclone's remote control does."""
+import base64, http.server, os, re, sys, urllib.parse
 if sys.argv[1] == "listremotes":
     print("gds:"); print("other:"); sys.exit(0)
-assert sys.argv[1:3] == ["serve", "http"], sys.argv
-target = sys.argv[3]
-host, port = sys.argv[sys.argv.index("--addr") + 1].split(":")
+assert sys.argv[1:3] == ["rcd", "--rc-serve"], sys.argv
+host, port = sys.argv[sys.argv.index("--rc-addr") + 1].split(":")
 root = os.environ["FAKE_RCLONE_ROOT"]
-open(os.path.join(root, "starts.log"), "a").write(target + "\\n")
-expected = "Basic " + base64.b64encode(("%%s:%%s" %% (os.environ["RCLONE_USER"], os.environ["RCLONE_PASS"])).encode()).decode()
+open(os.path.join(root, "starts.log"), "a").write(" ".join(sys.argv[1:]) + "\\n")
+expected = "Basic " + base64.b64encode(("%%s:%%s" %% (os.environ["RCLONE_RC_USER"], os.environ["RCLONE_RC_PASS"])).encode()).decode()
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_GET(self):
-        path = os.path.join(root, "files", urllib.parse.unquote(self.path).lstrip("/"))
-        if self.headers.get("Authorization") != expected:
+        match = re.match(r"^/\\[(.*?)\\](.*)$", urllib.parse.unquote(self.path))
+        if self.headers.get("Authorization") != expected or not match:
             self.send_response(401); self.send_header("Content-Length", "0"); self.end_headers(); return
+        open(os.path.join(root, "remotes.log"), "a").write(match.group(1) + "\\n")
+        path = os.path.join(root, "files", match.group(2).lstrip("/"))
         if not os.path.isfile(path):
             self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
         data = open(path, "rb").read()
-        self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
-        self.wfile.write(data)
-http.server.HTTPServer((host, int(port)), Handler).serve_forever()
+        ranged = re.match(r"bytes=(\\d*)-(\\d*)$", self.headers.get("Range") or "")
+        if not ranged:
+            self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
+            self.wfile.write(data); return
+        open(os.path.join(root, "ranges.log"), "a").write(self.headers["Range"] + "\\n")
+        first, last = ranged.groups()
+        start = int(first) if first else max(0, len(data) - int(last))
+        stop = int(last) + 1 if first and last else len(data)
+        body = data[start:stop]
+        slow = os.path.join(root, "slow")
+        if self.headers["Range"] != "bytes=0-0" and os.path.exists(slow):
+            import time; time.sleep(float(open(slow).read()))     # Google Drive took 20 s once
+        self.send_response(206); self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Range", "bytes %%d-%%d/%%d" %% (start, start + len(body) - 1, len(data)))
+        self.end_headers()
+        cut = os.path.join(root, "cut_after")
+        if start > 0 and os.path.exists(cut):          # the connection drops once, part way
+            count = int(open(cut).read()); os.remove(cut)
+            self.wfile.write(body[:count]); self.wfile.flush(); self.connection.close(); return
+        self.wfile.write(body)
+http.server.ThreadingHTTPServer((host, int(port)), Handler).serve_forever()
 ''' % sys.executable
 
 
@@ -379,8 +519,12 @@ class RcloneSourceTests(unittest.TestCase):
         job = self.job("영화/인터스텔라 (2014)/Interstellar [x265].mkv")
         self.assertEqual(self.fetch(job), (200, b"gds-bytes"))
         self.assertEqual(self.fetch(job), (200, b"gds-bytes"))
-        # One rclone per remote and root folder, kept running between jobs.
-        self.assertEqual((self.root / "starts.log").read_text().splitlines(), ["gds:{1AbC_dEf-9}"])
+        # One rclone per remote and root folder, kept running between jobs; the root folder is
+        # part of each request's address.
+        self.assertEqual(len((self.root / "starts.log").read_text().splitlines()), 1)
+        self.assertEqual(set((self.root / "remotes.log").read_text().splitlines()), {"gds:{1AbC_dEf-9}"})
+        # The password reaches rclone through its environment, never its command line.
+        self.assertNotIn("pass", (self.root / "starts.log").read_text())
 
     def test_a_missing_file_gets_one_fresh_listing(self):
         job = self.job("영화/new episode.mkv")
@@ -396,6 +540,12 @@ class RcloneSourceTests(unittest.TestCase):
             job = self.job("영화/not on this remote.mkv", server_fallback=True)
             job.api = SimpleNamespace(base_url=server.url.rsplit("/", 1)[0], token="runner")
             self.assertEqual(self.fetch(job), (200, b"server-bytes"))
+            # Meanwhile the runner's rclone looked for the file (once more after a restart) and
+            # gave up on it.
+            for _ in range(100):
+                if job.source == {"kind": "server"}:
+                    break
+                time.sleep(0.05)
             self.assertEqual(job.source, {"kind": "server"})
             # The next job on that remote skips rclone for a while instead of failing again first.
             starts = len((self.root / "starts.log").read_text().splitlines())
@@ -450,8 +600,490 @@ class RcloneSourceTests(unittest.TestCase):
         self.assertEqual(config.data["rclone_remotes"], [])
 
 
+def ebml(element: int, payload: bytes, size: bytes = None) -> bytes:
+    """A Matroska element: its ID bytes, an 8-byte size and the payload (or a size of its own)."""
+    width = (element.bit_length() + 7) // 8
+    return element.to_bytes(width, "big") + (size if size is not None else b"\x01" + len(payload).to_bytes(7, "big")) + payload
+
+
+def matroska(attachment_bytes: int, cluster_bytes: int, cues_at_end: int, tail_bytes: int):
+    """A Matroska file shaped like a muxer writes it: SeekHead, Info, fonts (Attachments), then
+    Clusters, with the Cues near the end. Returns (bytes, first cluster offset, cues offset)."""
+    header = ebml(agent.MKV_EBML, b"\x42\x86\x81\x01")
+    segment_start = len(header) + 4 + 8
+    info = ebml(0x1549A966, b"\x2a\xd7\xb1\x83\x0f\x42\x40")
+    attachments = ebml(0x1941A469, b"F" * attachment_bytes)
+    cluster = ebml(agent.MKV_CLUSTER, b"C" * cluster_bytes)
+    seekhead_size = len(ebml(agent.MKV_SEEKHEAD, ebml(agent.MKV_SEEK, ebml(0x53AB, b"\x1c\x53\xbb\x6b")
+                                                                   + ebml(agent.MKV_SEEK_POSITION, b"\x00" * 8))))
+    body_before_cues = seekhead_size + len(info) + len(attachments) + len(cluster) + cues_at_end
+    seekhead = ebml(agent.MKV_SEEKHEAD, ebml(agent.MKV_SEEK, ebml(0x53AB, b"\x1c\x53\xbb\x6b")
+                                             + ebml(agent.MKV_SEEK_POSITION, body_before_cues.to_bytes(8, "big"))))
+    cues = ebml(0x1C53BB6B, b"Q" * 1024)
+    data = (header + agent.MKV_SEGMENT.to_bytes(4, "big") + b"\x01" + b"\xff" * 7 + seekhead + info
+            + attachments + cluster + b"P" * cues_at_end + cues + b"T" * tail_bytes)
+    first_cluster = segment_start + seekhead_size + len(info) + len(attachments)
+    return data, first_cluster, segment_start + body_before_cues
+
+
+def mp4_box(kind: bytes, payload_bytes: int, declared: int = None) -> bytes:
+    size = declared if declared is not None else 8 + payload_bytes
+    return size.to_bytes(4, "big") + kind + b"\x00" * payload_bytes
+
+
+class SourcePlanTests(unittest.TestCase):
+    """FFmpeg reads the whole header, the first packets and the index while it opens a file.
+    Fonts made a Matroska header 12.6 MB, and MP4 indexes (moov) were 3.6-6.3 MB at either end:
+    each read outside the prefetched 1 MB head and 4 MB tail cost another 1.5-3 s (2026-11-18)."""
+
+    MB = 1024 * 1024
+
+    def test_matroska_fonts_are_read_through_to_the_first_packets(self):
+        head, first_cluster, cues = matroska(12_600_000, 0, 5 * self.MB, 0)
+        size = 4_307_550_930
+        plan = agent.plan_source_regions(head[:64 * 1024], size)
+        self.assertEqual(plan[0], (0, first_cluster + 4 * self.MB))     # from the sizes alone
+        # The index the SeekHead points at, far from the header.
+        self.assertEqual(plan[1:], [(cues, cues + 2 * self.MB)])
+
+    def test_matroska_without_fonts_reads_from_the_cluster_it_sees(self):
+        data, first_cluster, _ = matroska(100, 5000, 0, 0)
+        plan = agent.plan_source_regions(data, 3_000_000_000)
+        self.assertEqual(plan[0], (0, first_cluster + 4 * self.MB))
+
+    def test_mp4_index_at_either_end(self):
+        size = 4_233_946_657                        # moov after the media data
+        head = mp4_box(b"ftyp", 24) + mp4_box(b"free", 0) + mp4_box(b"mdat", 64, declared=4_227_640_727)
+        self.assertEqual(agent.plan_source_regions(head, size),
+                         [(0, 48 + 4 * self.MB), (4_227_640_767, size)])
+        size = 2_577_231_988                        # a 5.3 MB moov in front of it
+        head = mp4_box(b"ftyp", 24) + mp4_box(b"moov", 64, declared=5_254_638)
+        self.assertEqual(agent.plan_source_regions(head, size), [(0, 5_254_670 + 16 + 4 * self.MB)])
+        # A 64-bit mdat size.
+        head = mp4_box(b"ftyp", 24) + (1).to_bytes(4, "big") + b"mdat" + (6_000_000_000).to_bytes(8, "big")
+        self.assertEqual(agent.plan_source_regions(head, 6_000_000_100),
+                         [(0, 48 + 4 * self.MB), (6_000_000_032, 6_000_000_100)])
+
+    def test_unknown_or_damaged_files_plan_nothing(self):
+        self.assertEqual(agent.plan_source_regions(b"\x47" * 4096, 10 ** 9), [])     # MPEG-TS
+        self.assertEqual(agent.plan_source_regions(b"\x1a\x45\xdf\xa3\x00", 10 ** 9), [])
+        self.assertEqual(agent.plan_source_regions(mp4_box(b"ftyp", 4, declared=3), 10 ** 9), [])
+        # Nothing over the region limit.
+        head = mp4_box(b"ftyp", 24) + mp4_box(b"moov", 64, declared=900 * self.MB)
+        self.assertEqual(agent.plan_source_regions(head, 10 ** 10), [(0, agent.SOURCE_REGION_MAX_BYTES)])
+
+    def test_the_planned_ranges_answer_ffmpegs_opening_reads(self):
+        data, first_cluster, cues = matroska(300_000, 50_000, 600_000, 20_000)
+        upstream = Upstream(data)
+        upstream.token = "t"
+        api = SimpleNamespace(base_url="http://server", token="runner", host="127.0.0.1")
+        proxy = agent.SourceProxy(api)
+        saved = (agent.SOURCE_HEAD_BYTES, agent.SOURCE_TAIL_BYTES, agent.SOURCE_PACKET_BYTES,
+                 agent.SOURCE_PLAN_BYTES, agent.SOURCE_INDEX_GUESS_BYTES)
+        (agent.SOURCE_HEAD_BYTES, agent.SOURCE_TAIL_BYTES, agent.SOURCE_PACKET_BYTES,
+         agent.SOURCE_PLAN_BYTES, agent.SOURCE_INDEX_GUESS_BYTES) = 4096, 8192, 16384, 1024, 4096
+        try:
+            job = SimpleNamespace(id=JOB_ID, nonce="n" * 32, stopped=threading.Event(), part_id=3, cache=None,
+                                  api=api, source={"kind": "url", "url": upstream.url,
+                                                   "headers": {"Authorization": "Bearer t"}})
+            proxy.jobs[JOB_ID] = job
+            proxy.prefetch(job)
+            for _ in range(100):
+                if job.cache.planned and job.cache.idle(5):
+                    break
+                time.sleep(0.02)
+            self.assertEqual(sorted(r for _, r in upstream.seen), sorted([
+                "bytes=0-4095", "bytes=-8192", "bytes=4096-%d" % (first_cluster + 16384 - 1),
+                "bytes=%d-%d" % (cues, cues + 4096 - 1)]))
+            asked = len(upstream.seen)
+            for start, end in ((0, first_cluster + 16000), (cues, cues + 1000), (len(data) - 5000, len(data) - 1)):
+                conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=10)
+                conn.request("GET", "/%s/%s/media" % (JOB_ID, job.nonce), headers={"Range": "bytes=%d-%d" % (start, end)})
+                response = conn.getresponse()
+                self.assertEqual((response.status, response.read()), (206, data[start:end + 1]))
+                conn.close()
+            self.assertEqual(len(upstream.seen), asked)        # FFmpeg's opening reads stay local
+        finally:
+            (agent.SOURCE_HEAD_BYTES, agent.SOURCE_TAIL_BYTES, agent.SOURCE_PACKET_BYTES,
+             agent.SOURCE_PLAN_BYTES, agent.SOURCE_INDEX_GUESS_BYTES) = saved
+            proxy.server.shutdown()
+            upstream.server.shutdown()
+
+
+class SlowServer:
+    """The Shyni server's /source for a job: needs the runner token, sends slowly (a far server)."""
+
+    def __init__(self, data, pause=0.05, block=64 * 1024):
+        server = self
+        self.data, self.ranges, self.status = data, [], None
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                server.ranges.append(self.headers.get("Range"))
+                if self.headers.get("Authorization") != "Bearer runner" or server.status:
+                    self.send_response(server.status or 401)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                first, _, last = (self.headers.get("Range") or "bytes=0-").split("=")[1].partition("-")
+                start = int(first) if first else len(server.data) - int(last)
+                stop = int(last) + 1 if first and last else len(server.data)
+                body = server.data[start:stop]
+                self.send_response(206)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, stop - 1, len(server.data)))
+                self.end_headers()
+                try:
+                    for index in range(0, len(body), block):
+                        self.wfile.write(body[index:index + block])
+                        self.wfile.flush()
+                        time.sleep(pause)
+                except OSError:
+                    pass                                      # the runner switched to its rclone
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base_url = "http://127.0.0.1:%d" % self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+
+class ServerFirstTests(unittest.TestCase):
+    """Until the runner's rclone has found the file's folder (4-8 s for a new folder), or when it
+    fails, the server that gave the job sends the bytes; reading moves to rclone at a byte boundary
+    as soon as it can, so a far server does not set the pace for the whole film."""
+
+    PATH = "영화/인터스텔라 (2014)/Interstellar.mkv"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        binary = self.root / "rclone"
+        binary.write_text(FAKE_RCLONE)
+        binary.chmod(0o755)
+        self.data = bytes((index * 7 + index // 251) % 256 for index in range(2 * 1024 * 1024))
+        target = self.root / "files" / self.PATH
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.data)
+        os.environ["FAKE_RCLONE_ROOT"] = str(self.root)
+        self.servers = agent.RcloneServers(str(binary), None, self.root / "logs")
+        self.far = SlowServer(self.data)
+        self.proxy = agent.SourceProxy(SimpleNamespace(base_url=self.far.base_url, token="runner"), self.servers)
+        self.saved = agent.HANDOVER_MIN_BYTES, agent.HANDOVER_LEAD_SEC
+        agent.HANDOVER_MIN_BYTES, agent.HANDOVER_LEAD_SEC = 128 * 1024, 0.5
+
+    def tearDown(self):
+        agent.HANDOVER_MIN_BYTES, agent.HANDOVER_LEAD_SEC = self.saved
+        self.servers.close()
+        self.proxy.server.shutdown()
+        self.far.server.shutdown()
+        os.environ.pop("FAKE_RCLONE_ROOT", None)
+        self.tmp.cleanup()
+
+    def job(self, server_fallback=True):
+        source = agent.clean_source({"kind": "rclone", "remote": "gds", "folder_id": "1AbC", "path": self.PATH,
+                                     "server_fallback": server_fallback}, "server", ["gds"])
+        job = SimpleNamespace(id=JOB_ID, nonce="n" * 32, stopped=threading.Event(), source=source,
+                              api=SimpleNamespace(base_url=self.far.base_url, token="runner"))
+        self.proxy.jobs[JOB_ID] = job
+        return job
+
+    def read(self, job, ranged="bytes=0-"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.port, timeout=30)
+        conn.request("GET", "/%s/%s/media" % (job.id, job.nonce), headers={"Range": ranged})
+        response = conn.getresponse()
+        body = response.read()
+        conn.close()
+        return response.status, body
+
+    def rclone_ranges(self):
+        path = self.root / "ranges.log"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def test_the_server_starts_and_rclone_takes_over_at_a_byte_boundary(self):
+        job = self.job()
+        self.assertEqual(self.read(job), (206, self.data))
+        self.assertEqual(self.far.ranges, ["bytes=0-"])                 # began on the server at once
+        handover = [line for line in self.rclone_ranges() if line != "bytes=0-0"]
+        self.assertIn("bytes=0-0", self.rclone_ranges())                 # rclone looked the file up meanwhile
+        self.assertEqual(len(handover), 1)
+        start = int(handover[0].split("=")[1].rstrip("-"))
+        self.assertTrue(0 < start < len(self.data), handover)
+        # The next read on that folder goes to rclone directly.
+        self.assertEqual(self.read(job, "bytes=1000-1999"), (206, self.data[1000:2000]))
+        self.assertEqual(self.far.ranges, ["bytes=0-"])
+
+    def test_without_the_servers_offer_rclone_reads_it_alone(self):
+        job = self.job(server_fallback=False)
+        self.assertEqual(self.read(job), (206, self.data))
+        self.assertEqual(self.far.ranges, [])
+        self.assertEqual(self.rclone_ranges(), ["bytes=0-"])
+
+    def test_a_dropped_rclone_read_continues_from_the_server(self):
+        job = self.job()
+        self.assertEqual(self.read(job, "bytes=0-99"), (206, self.data[:100]))
+        for _ in range(100):                                            # rclone has found the file
+            if self.servers.ready(job.source):
+                break
+            time.sleep(0.05)
+        (self.root / "cut_after").write_text("300000")
+        self.far.ranges.clear()
+        self.assertEqual(self.read(job, "bytes=500000-"), (206, self.data[500000:]))
+        self.assertEqual(self.far.ranges[0], "bytes=800000-")
+
+    def test_a_slow_rclone_answer_is_raced_by_the_server(self):
+        job = self.job()
+        self.assertEqual(self.read(job, "bytes=0-99"), (206, self.data[:100]))
+        for _ in range(100):
+            if self.servers.ready(job.source):
+                break
+            time.sleep(0.05)
+        (self.root / "slow").write_text("5")
+        saved, agent.RCLONE_HEDGE_SEC = agent.RCLONE_HEDGE_SEC, 0.3
+        try:
+            began = time.monotonic()
+            self.assertEqual(self.read(job, "bytes=1000-1999"), (206, self.data[1000:2000]))
+            self.assertLess(time.monotonic() - began, 3)
+            self.assertEqual(self.far.ranges[-1], "bytes=1000-1999")
+        finally:
+            agent.RCLONE_HEDGE_SEC = saved
+            (self.root / "slow").unlink()
+
+    def test_before_rclone_is_ready_the_prefetch_asks_both(self):
+        job = self.job()
+        job.part_id, job.cache = 5, None
+        saved = agent.SOURCE_HEAD_BYTES, agent.SOURCE_TAIL_BYTES
+        agent.SOURCE_HEAD_BYTES, agent.SOURCE_TAIL_BYTES = 64 * 1024, 32 * 1024
+        try:
+            self.proxy.prefetch(job)
+            self.assertTrue(job.cache.idle(10))
+        finally:
+            agent.SOURCE_HEAD_BYTES, agent.SOURCE_TAIL_BYTES = saved
+        self.assertIn("bytes=0-65535", self.far.ranges)
+        for _ in range(100):                     # the slower one still asked (and found the folder)
+            if "bytes=0-65535" in self.rclone_ranges() and self.servers.ready(job.source):
+                break
+            time.sleep(0.05)
+        self.assertIn("bytes=0-65535", self.rclone_ranges())
+        self.assertTrue(self.servers.ready(job.source))
+        head = job.cache.region_at(0)
+        self.assertEqual(bytes(head.data), self.data[:65536])
+        self.assertEqual(self.read(job, "bytes=100-199"), (206, self.data[100:200]))
+
+    def test_a_server_that_cannot_send_it_leaves_it_to_rclone(self):
+        self.far.status = 404                       # an older server, or the job already ended there
+        job = self.job()
+        self.assertEqual(self.read(job), (206, self.data))
+        self.assertTrue(job.server_failed)
+        self.assertIn("bytes=0-", self.rclone_ranges())
+
+
+class SubtitlePrefetchTests(unittest.TestCase):
+    """FFmpeg opens the external subtitle only after reading the source up to the start position,
+    so its request to the server sat on the path to the first segment. The agent fetches it as the
+    job starts and serves FFmpeg from memory."""
+
+    def setUp(self):
+        self.text = ("1\n00:00:01,000 --> 00:00:02,000\n안녕\n\n" * 50).encode()
+        self.status = 200
+        self.hits = []
+        test = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                test.hits.append((self.path, self.headers.get("Range")))
+                ok = self.headers.get("Authorization") == "Bearer runner" and test.status == 200
+                body = test.text if ok else b""
+                self.send_response(200 if ok else test.status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        api = SimpleNamespace(base_url="http://127.0.0.1:%d" % self.server.server_address[1], token="runner")
+        self.proxy = agent.SourceProxy(api)
+        self.job = SimpleNamespace(id=JOB_ID, nonce="n" * 32, stopped=threading.Event(), api=api,
+                                   source={"kind": "server"})
+        self.proxy.jobs[JOB_ID] = self.job
+
+    def tearDown(self):
+        self.proxy.server.shutdown()
+        self.server.shutdown()
+
+    def read(self, ranged=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.port, timeout=10)
+        conn.request("GET", "/%s/%s/subtitle" % (JOB_ID, self.job.nonce), headers={"Range": ranged} if ranged else {})
+        response = conn.getresponse()
+        body = response.read()
+        conn.close()
+        return response.status, body
+
+    def test_the_subtitle_is_fetched_once_at_job_start_and_served_locally(self):
+        self.proxy.prefetch_subtitle(self.job)
+        self.assertTrue(self.job.subtitle_ready.wait(5))
+        self.assertEqual(self.read("bytes=0-"), (206, self.text))
+        self.assertEqual(self.read("bytes=10-19"), (206, self.text[10:20]))
+        self.assertEqual(self.read(), (200, self.text))
+        self.assertEqual(len(self.hits), 1)
+
+    def test_a_failed_prefetch_leaves_it_to_the_server(self):
+        self.status = 404
+        self.proxy.prefetch_subtitle(self.job)
+        self.assertTrue(self.job.subtitle_ready.wait(5))
+        self.assertEqual(self.read("bytes=0-")[0], 404)
+        self.assertEqual(len(self.hits), 2)                  # the prefetch, then FFmpeg's own request
+
+
 CAPS = {"video_encoder": "h264_videotoolbox", "hw_encoder": "h264_videotoolbox", "tonemap": True,
         "ffmpeg_version": "8.1"}
+
+
+M1_CAPS = {
+    "video_encoder": "h264_videotoolbox", "hw_encoder": "h264_videotoolbox", "tonemap": True,
+    "video_encoders": {"h264": "h264_videotoolbox", "hevc": "hevc_videotoolbox"},
+    "hls_fmp4_subtitles": True, "vaapi_device": None, "vaapi_driver": None, "hw_decode": None,
+}
+
+
+def fake_agent(api, tmp, caps):
+    return SimpleNamespace(
+        api=api, config=SimpleNamespace(tmp_dir=Path(tmp)), caps=caps, ffmpeg="/opt/ffmpeg",
+        proxy=SimpleNamespace(jobs={}, url_for=lambda job, what: "http://127.0.0.1:5/%s/n/%s" % (job.id, what)),
+        job_finished=lambda job: None,
+    )
+
+
+class OutputCodecTests(unittest.TestCase):
+    def job(self, tmp, caps, **spec):
+        return agent.Job(fake_agent(FakeApi(), tmp, caps), {
+            "id": JOB_ID, "kind": "hls", "spec": {"mode": "video", "max_height": 480, **spec},
+            "source": {"kind": "server"}, "has_subtitle_file": True,
+        })
+
+    def test_the_servers_codec_is_encoded_with_this_machines_encoder_for_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = self.job(tmp, M1_CAPS, output_codec="hevc", audio_bitrate_kbps=128,
+                           audio_output_max_channels=2, audio_channels=6,
+                           subtitle={"source": "external"})
+            job._choose_encoder()
+            args = job._arguments()
+            self.assertEqual((job.output_codec, job.encoder), ("hevc", "hevc_videotoolbox"))
+            self.assertEqual(args[args.index("-c:v") + 1], "hevc_videotoolbox")
+            self.assertEqual(args[args.index("-b:v") + 1], "1000k")
+            self.assertEqual(args[args.index("-tag:v") + 1], "hvc1")
+            self.assertEqual(args[args.index("-b:a"):args.index("-b:a") + 4], ["-b:a", "128k", "-ac", "2"])
+            # HEVC is never MPEG-TS, although the server default (and a subtitle rendition) is.
+            self.assertEqual(args[args.index("-hls_segment_type") + 1], "fmp4")
+            self.assertEqual(args[args.index("-var_stream_map") + 1], "v:0,a:0,s:0,sgroup:subs")
+
+    def test_a_codec_this_machine_cannot_encode_falls_back_to_h264(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for caps, wanted in ((M1_CAPS, "av1"), ({**M1_CAPS, "video_encoders": {}}, "hevc"),
+                                 ({"video_encoder": "libx264", "hw_encoder": None}, "hevc")):
+                job = self.job(tmp, caps, output_codec=wanted, subtitle={"source": "external"})
+                job._choose_encoder()
+                args = job._arguments()
+                self.assertEqual((job.output_codec, job.encoder), ("h264", caps["video_encoder"]))
+                self.assertEqual(args[args.index("-c:v") + 1], caps["video_encoder"])
+                self.assertEqual(args[args.index("-b:v") + 1], "1500k")
+                self.assertNotIn("-tag:v", args)
+                self.assertEqual(args[args.index("-hls_segment_type") + 1], "mpegts")
+
+    def test_capabilities_report_the_codecs_and_the_fmp4_subtitle_check(self):
+        public = agent.public_capabilities(M1_CAPS, ["gds"])
+        self.assertEqual(public["video_encoders"], {"h264": "h264_videotoolbox", "hevc": "hevc_videotoolbox"})
+        self.assertIs(public["hls_fmp4_subtitles"], True)
+        self.assertEqual((public["video_encoder"], public["hw_encoder"]), ("h264_videotoolbox",) * 2)
+        software = agent.public_capabilities({"video_encoder": "libx264", "video_encoders": {"hevc": "libx265"}})
+        self.assertEqual((software["video_encoders"], software["hls_fmp4_subtitles"]), ({"h264": "libx264"}, False))
+        self.assertEqual(agent.describe_output_codecs(M1_CAPS), "H.264, H.265")
+        self.assertIn("H.264)", agent.describe_output_codecs({**M1_CAPS, "hls_fmp4_subtitles": False}))
+
+    def test_detection_probes_the_same_family_and_keeps_what_passes(self):
+        listed = " ".join(" %s " % name for name in (
+            "libx264", "h264_nvenc", "hevc_nvenc", "av1_nvenc", "hevc_vaapi"))
+        probed = []
+
+        def run(ffmpeg, args, timeout=15.0, env=None):
+            if "-version" in args:
+                return 0, "ffmpeg version 8.1"
+            return (0, listed) if "-encoders" in args else (0, " zscale  tonemap ")
+
+        def smoke(ffmpeg, encoder, device=None, driver=None):
+            probed.append(encoder)
+            return encoder != "av1_nvenc"             # this card has no AV1 encoder
+
+        originals = {name: getattr(agent, name) for name in (
+            "run_ffmpeg", "_smoke_test_encoder", "probe_hw_decode", "probe_hls_fmp4_subtitles",
+            "_ordered_hw_encoder_candidates")}
+        agent.run_ffmpeg, agent._smoke_test_encoder = run, smoke
+        agent.probe_hw_decode = lambda ffmpeg, caps: None
+        agent.probe_hls_fmp4_subtitles = lambda ffmpeg, caps, timeout=15.0: "hevc" in caps["video_encoders"]
+        agent._ordered_hw_encoder_candidates = lambda preference: ("h264_nvenc",)
+        try:
+            caps = agent.detect_capabilities("/opt/ffmpeg")
+            agent._ordered_hw_encoder_candidates = lambda preference: ()
+            software = agent.detect_capabilities("/opt/ffmpeg")
+        finally:
+            for name, original in originals.items():
+                setattr(agent, name, original)
+        self.assertEqual(probed, ["h264_nvenc", "hevc_nvenc", "av1_nvenc"])      # never hevc_vaapi
+        self.assertEqual(caps["video_encoders"], {"h264": "h264_nvenc", "hevc": "hevc_nvenc"})
+        self.assertIs(caps["hls_fmp4_subtitles"], True)
+        self.assertEqual((caps["video_encoder"], caps["hw_encoder"]), ("h264_nvenc", "h264_nvenc"))
+        self.assertEqual(software["video_encoders"], {"h264": "libx264"})
+        self.assertIs(software["hls_fmp4_subtitles"], False)
+
+
+class RunningReportTests(unittest.TestCase):
+    """The server gives up on a job that is not reported running within a few seconds. A remote
+    source can take longer than that to produce the first output, so the report must not wait."""
+
+    def run_job(self, caps, kind="hls"):
+        with tempfile.TemporaryDirectory() as tmp:
+            api = FakeApi()
+            job = agent.Job(fake_agent(api, tmp, caps), {
+                "id": JOB_ID, "kind": kind, "spec": {"mode": "video", "video_codec": "h264"},
+                "source": {"kind": "server"},
+            })
+            events = []
+            output_ready = threading.Event()
+
+            def states():
+                return [json.loads(body)["state"] for _method, name, body in api.calls if name == "state"]
+
+            def start_ffmpeg(encoder):
+                events.append(("ffmpeg", states()))
+                job.proc = SimpleNamespace(
+                    poll=lambda: 0 if output_ready.is_set() else None, wait=lambda: 0, returncode=0,
+                    kill=lambda: None)
+
+            def wait_for_output(*_args):
+                # ffmpeg is still opening the source: nothing has been written yet.
+                events.append(("waiting", states()))
+                output_ready.set()
+                return b""
+
+            job._start_ffmpeg = start_ffmpeg
+            job._first_output = wait_for_output
+            job._sync_outputs = wait_for_output
+            job._pump_pipe = wait_for_output
+            job.run()
+            return events, states()
+
+    def test_running_is_reported_before_the_wait_for_the_first_output(self):
+        decoding = {**M1_CAPS, "hw_decode": {"hwaccel": "videotoolbox", "codecs": {"h264": [8]}}}
+        for caps, kind in ((decoding, "hls"), (decoding, "pipe"), (M1_CAPS, "hls"), (M1_CAPS, "pipe")):
+            events, states = self.run_job(caps, kind)
+            self.assertEqual(events[0], ("ffmpeg", []), (kind, events))         # nothing before ffmpeg starts
+            # The first wait for output already sees the report, and only that report.
+            self.assertEqual(events[1], ("waiting", ["running"]), (kind, events))
+            self.assertEqual(states, ["running", "finished"])
 
 
 class FakeJob:
@@ -572,7 +1204,7 @@ class SharedSlotTests(unittest.TestCase):
                                      "source": {"kind": "server"}}, self.two)
         self.assertIs(job.api, self.two.api)
         self.two.api.base_url, self.two.api.token = "https://two.example", "b"
-        url, headers = self.agent.proxy._upstream(job, "media")
+        url, headers = self.agent.proxy._upstream(job, self.agent.proxy._via(job, "media"))
         self.assertEqual((url, headers["Authorization"]),
                          ("https://two.example/transcode-agent/jobs/%s/source" % job_id(9), "Bearer b"))
 

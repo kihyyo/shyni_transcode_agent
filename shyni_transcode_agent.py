@@ -20,7 +20,8 @@ GitHub self-hosted runner 처럼 쓴다. Shyni 관리자 화면(설정 → 관�
   이 에이전트가 자기 인코더에 맞춰 만든다. 입력은 http(s) 원본뿐이고 출력은 작업 폴더 안이다.
 - ffmpeg 는 원본을 이 에이전트의 loopback 프록시(127.0.0.1)로 읽는다. 클라우드 자격은
   프록시가 붙이므로 ffmpeg 명령줄에 남지 않고, 만료되면 프록시가 서버에서 새로 받는다.
-- rclone 리모트는 이 기기의 주인이 설치할 때 이름을 적어 준 것만 쓴다. 서버는 그 이름과
+- rclone 리모트는 설치 명령(`--rclone-remote`)에 적힌 이름 가운데 이 기기의 rclone 설정에 있는
+  것만 쓴다(서버 관리자 화면의 설치 명령에는 그 서버의 리모트 이름이 들어 있다). 서버는 그 이름과
   경로만 보내고, 자격은 이 기기의 rclone 설정에 있는 것을 쓴다.
 - 에이전트는 스스로 갱신되지 않는다. 새 버전은 이 기기에서 `update` 를 실행해 받는다.
 
@@ -64,7 +65,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 PROTOCOL_VERSION = 1
 # 이 파일이 공개된 곳. `update` 가 여기서 새 버전을 받는다.
 SOURCE_URL = os.environ.get(
@@ -90,6 +91,7 @@ WINDOWS_RUN_VALUE = "ShyniTranscodeAgent"
 RESTART_REQUEST = "restart.request"
 STOP_REQUEST = "stop.request"
 AGENT_LOG = "agent.log"
+RUNNER_STATE_HEADER = "X-Shyni-Runner"
 AGENT_LOG_ROTATE_BYTES = 10 * 1024 * 1024
 WINDOWS = os.name == "nt"
 # 콘솔 없이 도는 에이전트(Windows 의 pythonw)가 ffmpeg·rclone 을 띄울 때마다 콘솔 창이 번쩍이지
@@ -136,6 +138,11 @@ class AgentError(Exception):
 
 class Unauthorized(AgentError):
     pass
+
+
+class RunnerRemoved(Unauthorized):
+    """서버가 이 러너를 모른다고 분명히 알렸다(관리자가 러너 목록에서 지웠다). 앞단 프록시 등이 낸 401 과
+    구별하려고 서버가 `X-Shyni-Runner: unknown` 머리를 붙인다(서버가 그 머리를 안 보내면 그냥 401)."""
 
 
 class JobGone(AgentError):
@@ -1351,7 +1358,9 @@ class Api:
         if payload is not None:
             body = json.dumps(payload).encode()
             headers = {"Content-Type": "application/json"}
-        status, _, data = self.request(method, path, body=body, headers=headers, timeout=timeout)
+        status, response_headers, data = self.request(method, path, body=body, headers=headers, timeout=timeout)
+        if status == 401 and str(response_headers.get(RUNNER_STATE_HEADER) or "").lower() == "unknown":
+            raise RunnerRemoved(_detail(data) or "등록되지 않은 러너입니다")
         return self.decode(status, data)
 
     @staticmethod
@@ -3419,6 +3428,9 @@ class Agent:
                                       timeout=POLL_WAIT_SEC + 20)
                 delay = 2
                 link.last_ok = time.monotonic()
+            except RunnerRemoved:
+                self.forget(link)
+                return
             except Unauthorized:
                 log("%s 가 이 러너를 모릅니다(등록 해제됨). 그 서버의 설치 명령을 다시 실행하거나 "
                     "remove-server 로 지우세요. 1분 뒤 재시도합니다." % link.label)
@@ -3447,6 +3459,32 @@ class Agent:
         deadline = time.monotonic() + seconds
         while self.running and time.monotonic() < deadline:
             time.sleep(0.5)
+
+    def forget(self, link) -> None:
+        """관리자가 그 서버의 러너 목록에서 이 러너를 지웠다. 이 기기에서도 그 서버 등록을 지우고, 붙은
+        서버가 남지 않으면 자동 시작을 해제하고 끝낸다. 그래서 같은 설치 명령을 다시 실행하면 처음처럼
+        등록된다. 폴더(받아 둔 ffmpeg 등)는 남긴다 — 다시 설치할 때 그대로 쓴다."""
+        self.stop_jobs(link, "등록이 해제됐습니다")
+        with self.lock:
+            # 그사이 configure·install 이 바꾼 설정을 덮지 않도록 파일을 다시 읽어 그 등록만 뺀다.
+            # 다시 설치해 토큰이 바뀌었으면 지울 것이 없다.
+            config = Config(self.config.home)
+            kept = [entry for entry in config.servers if entry.get("token") != link.api.token]
+            removed = len(kept) != len(config.servers)
+            if removed:
+                config.data["servers"] = kept
+                config.save()
+            self.config.data["servers"] = list(kept)
+            self.links = [item for item in self.links if item is not link]
+        if not removed:
+            return
+        log("%s 가 이 러너를 지웠습니다. 이 기기에서도 그 서버 등록을 지웠습니다." % link.label)
+        if kept:
+            return
+        log("붙은 서버가 없어 자동 시작을 해제하고 끝냅니다. 폴더 %s 는 남겨 둡니다(다시 설치하면 받아 둔 "
+            "ffmpeg 를 그대로 씀, 필요 없으면 지워도 됨)." % self.config.home)
+        self.running = False
+        remove_own_autostart(self.config.home)
 
     def shutdown(self, *_args) -> None:
         self.running = False
@@ -3511,8 +3549,13 @@ def _describe(caps: dict, ffmpeg: str, slots: int, tmp_dir: Path, rclone_remotes
     print("  rclone   : %s" % (", ".join(rclone_remotes) if rclone_remotes else "쓰지 않음(원본은 서버나 클라우드 주소로 읽음)"))
 
 
-def apply_rclone_options(config: Config, args) -> None:
-    """--rclone-remote 로 적은 리모트를 이 기기의 rclone 설정에서 확인하고 허용 목록에 올린다."""
+def apply_rclone_options(config: Config, args, installing: bool = False) -> None:
+    """--rclone-remote 로 적은 리모트를 이 기기의 rclone 설정에서 확인하고 허용 목록에 올린다.
+
+    configure 는 목록을 적은 것으로 바꾸고, 없는 리모트·rclone 은 오류다. install 은 서버 관리자 화면의
+    설치 명령이 그 서버의 리모트 이름을 모두 적어 오므로(0.6.1+) 이 기기에 있는 것만 지금 목록에 더하고
+    나머지는 알리고 건너뛴다 — rclone 이 없는 기기도 그대로 설치되고, 다른 서버를 더해도 앞 서버의
+    리모트가 지워지지 않는다."""
     if getattr(args, "rclone", None):
         config.data["rclone"] = args.rclone
     if getattr(args, "rclone_config", None):
@@ -3524,17 +3567,27 @@ def apply_rclone_options(config: Config, args) -> None:
     for name in remotes:
         if not _REMOTE_NAME_RE.fullmatch(name):
             raise AgentError("rclone 리모트 이름이 올바르지 않습니다: %s" % name)
+    missing = []
     if remotes:
         binary = find_rclone(config.data.get("rclone"))
         if not binary:
+            if installing:
+                print("참고: rclone 을 찾지 못해 rclone 리모트(%s)를 쓰지 않습니다. 원본은 서버가 내줍니다. "
+                      "rclone 이 다른 곳에 있으면 --rclone <경로> 를 붙여 다시 실행하세요." % ", ".join(remotes))
+                return
             raise AgentError("rclone 을 찾을 수 없습니다: %s (--rclone 로 경로를 지정하세요)"
                              % (config.data.get("rclone") or "rclone"))
         config.data["rclone"] = binary       # 서비스로 돌 때도 찾도록 전체 경로를 적어 둔다
         present = rclone_list_remotes(binary, config.data.get("rclone_config"))
         missing = [name for name in remotes if name not in present]
-        if missing:
+        if missing and not installing:
             raise AgentError("이 기기의 rclone 설정에 없는 리모트입니다: %s (있는 것: %s)" % (
                 ", ".join(missing), ", ".join(present) or "없음"))
+        if missing:
+            print("참고: 이 기기의 rclone 설정에 없는 리모트는 쓰지 않습니다: %s" % ", ".join(missing))
+    if installing:
+        remotes = list(dict.fromkeys(list(config.data.get("rclone_remotes") or [])
+                                     + [name for name in remotes if name not in missing]))
     config.data["rclone_remotes"] = remotes
 
 
@@ -3545,9 +3598,9 @@ def command_install(args) -> int:
     if not args.url or not args.token:
         raise AgentError("--url 과 --token 이 필요합니다")
     api = Api(args.url, args.token)
+    # 이미 이 서버에 등록된 폴더면 그 등록을 바꾼다(0.6.1 부터 --force 불필요). 관리자가 러너를 지운 뒤
+    # 다시 설치하는 경우이거나, 아직 서버에 있으면 서버가 이전 러너를 지워(replaces) 둘로 남지 않는다.
     existing = next((entry for entry in config.servers if entry.get("url") == api.base_url), None)
-    if existing is not None and not args.force:
-        raise AgentError("이미 이 서버에 등록된 폴더입니다: %s (다시 등록하려면 --force)" % home)
     adding = existing is None and bool(config.servers)
     if args.encoder or not config.data.get("encoder"):
         encoder = str(args.encoder or "auto").lower()
@@ -3560,7 +3613,7 @@ def command_install(args) -> int:
     tmp_dir.mkdir(parents=True, exist_ok=True)
     if args.slots:
         config.data["slots"] = max(1, int(args.slots))
-    apply_rclone_options(config, args)
+    apply_rclone_options(config, args, installing=True)
     rclone_remotes = usable_rclone_remotes(config.data)
     ffmpeg, caps = choose_ffmpeg(config, args.ffmpeg)
     config.data["ffmpeg"] = ffmpeg
@@ -3575,6 +3628,7 @@ def command_install(args) -> int:
         "protocol": PROTOCOL_VERSION, "agent_version": __version__,
         "platform": machine_info(), "capabilities": public_capabilities(caps, rclone_remotes),
         "recommended_slots": slots, "temp_dir": str(tmp_dir), "temp_free_bytes": free,
+        **({"replaces": existing.get("token")} if existing is not None and existing.get("token") else {}),
     })
     entry = {"url": api.base_url, "token": registered["token"],
              "runner_id": registered["runner_id"], "name": registered["name"]}
@@ -3586,6 +3640,8 @@ def command_install(args) -> int:
     config.save()
     print()
     print("등록 완료: %s (러너 #%s) → %s" % (registered["name"], registered["runner_id"], api.base_url))
+    if registered.get("replaced"):
+        print("  이 폴더의 이전 등록(러너 #%s)은 서버에서 지웠습니다." % registered["replaced"])
     if adding:
         print("  이 기기가 붙은 서버 %d곳이 총 슬롯 %d개를 같이 씁니다." % (len(config.servers), slots))
     _describe(caps, ffmpeg, slots, tmp_dir, rclone_remotes)
@@ -4056,6 +4112,31 @@ def _quote(value: str) -> str:
     return '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def remove_own_autostart(home: Path) -> None:
+    """돌고 있는 에이전트가 스스로 자동 시작을 해제한다. 등록된 서비스가 이 폴더의 것일 때만 지운다(다른
+    폴더를 서비스로 돌리면서 이 폴더는 직접 실행했을 수 있다). service uninstall 과 달리 자기 자신이
+    끝나기를 기다리지 않는다 — macOS·Linux 는 마지막에 서비스를 멈추고, 그 SIGTERM 으로 이 프로세스가
+    끝난다(KeepAlive·Restart=always 가 다시 띄우지 않도록 파일부터 지운다)."""
+    system = platform.system()
+    if system == "Darwin":
+        path = _launch_agent_path()
+        if path.is_file() and "<string>%s</string>" % _xml(str(home)) in path.read_text(
+                encoding="utf-8", errors="replace"):
+            path.unlink()
+            subprocess.call(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif system == "Linux" and shutil.which("systemctl"):
+        path = _systemd_unit_path()
+        if path.is_file() and _quote(str(home)) in path.read_text(encoding="utf-8", errors="replace"):
+            _systemctl("disable", SYSTEMD_UNIT)
+            path.unlink()
+            _systemctl("daemon-reload")
+            _systemctl("stop", "--no-block", SYSTEMD_UNIT)
+    elif system == "Windows":
+        if " --dir %s " % subprocess.list2cmdline([str(home)]) in windows_autostart_command() + " ":
+            _windows_autostart(None)
+
+
 def command_uninstall(args) -> int:
     home = Path(args.dir).expanduser().resolve()
     command_service(argparse.Namespace(dir=str(home), action="uninstall"))
@@ -4080,7 +4161,8 @@ def main(argv=None) -> int:
     def add_rclone_options(item) -> None:
         item.add_argument("--rclone-remote", action="append", metavar="NAME",
                           help="이 기기의 rclone 으로 직접 읽을 리모트 이름(여러 번 쓸 수 있음). "
-                               "서버의 원본 리모트와 같은 이름이어야 한다")
+                               "서버의 원본 리모트와 같은 이름이어야 한다. install 은 이 기기에 없는 "
+                               "리모트를 건너뛰고 지금 목록에 더하며, configure 는 목록을 바꾼다")
         item.add_argument("--rclone", metavar="PATH", help="rclone 실행 파일(기본: PATH 의 rclone)")
         item.add_argument("--rclone-config", metavar="PATH", help="rclone 설정 파일(기본: rclone 기본 위치)")
 
@@ -4094,7 +4176,7 @@ def main(argv=None) -> int:
     install.add_argument("--slots", type=int, help="이 기기의 총 동시 작업 수(기본: 추천값)")
     add_rclone_options(install)
     install.add_argument("--no-service", action="store_true", help="서비스로 등록하지 않음")
-    install.add_argument("--force", action="store_true", help="이미 등록한 서버에 다시 등록")
+    install.add_argument("--force", action="store_true", help="(0.6.1 부터 필요 없음 — 이미 등록한 서버면 늘 다시 등록한다)")
     install.set_defaults(handler=command_install)
     run = with_dir("run", "작업을 받아 실행")
     # 서비스(Windows 시작 프로그램)가 쓰는 실행 방식: 출력은 <폴더>/agent.log, 다른 명령의 요청을 따른다.

@@ -2,7 +2,9 @@
 
     python3 -m unittest discover -s . -p 'test_*.py'
 """
+import contextlib
 import http.client
+import io
 import json
 import os
 import sys
@@ -600,6 +602,35 @@ class RcloneSourceTests(unittest.TestCase):
         agent.apply_rclone_options(config, SimpleNamespace(rclone=None, rclone_config=None, rclone_remote=[]))
         self.assertEqual(config.data["rclone_remotes"], [])
 
+    def test_install_command_names_the_servers_remotes_and_keeps_only_those_this_device_has(self):
+        """The admin screen's install command carries every rclone remote of that server (0.6.1)."""
+        def install(data, names, **options):
+            config = SimpleNamespace(data=data)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                agent.apply_rclone_options(config, SimpleNamespace(
+                    rclone=options.get("rclone"), rclone_config=None, rclone_remote=names), installing=True)
+            return config.data, out.getvalue()
+
+        data, out = install({"rclone": str(self.binary)}, ["gds", "115open"])
+        self.assertEqual(data["rclone_remotes"], ["gds"])
+        self.assertIn("115open", out)
+        # A second server adds its remotes to the list; the first server's stay.
+        data, _ = install({"rclone": str(self.binary), "rclone_remotes": ["gds"]}, ["other", "gds"])
+        self.assertEqual(data["rclone_remotes"], ["gds", "other"])
+        data, _ = install({"rclone": str(self.binary), "rclone_remotes": ["gds"]}, [])
+        self.assertEqual(data["rclone_remotes"], ["gds"])
+        # Without rclone the runner still installs and reads through the server.
+        saved = os.environ["PATH"], agent.RCLONE_SEARCH_DIRS
+        os.environ["PATH"], agent.RCLONE_SEARCH_DIRS = "/nonexistent", ()
+        try:
+            data, out = install({}, ["gds"])
+        finally:
+            os.environ["PATH"], agent.RCLONE_SEARCH_DIRS = saved
+        self.assertNotIn("rclone_remotes", data)
+        self.assertIn("rclone", out)
+        with self.assertRaises(agent.AgentError):          # a malformed name is still refused
+            install({"rclone": str(self.binary)}, ["-flag"])
+
 
 def ebml(element: int, payload: bytes, size: bytes = None) -> bytes:
     """A Matroska element: its ID bytes, an 8-byte size and the payload (or a size of its own)."""
@@ -1173,6 +1204,47 @@ class SharedSlotTests(unittest.TestCase):
         self.wait_for(lambda: len(self.two.api.called) == 2)
         self.assertEqual(self.two.api.called[-1][2]["busy_elsewhere"], 0)
 
+    def test_a_server_that_deleted_this_runner_is_forgotten_and_the_last_one_ends_the_agent(self):
+        class Removed(FakeApi):
+            def __init__(self, token):
+                super().__init__()
+                self.token = token
+
+            def call(self, *args, **kwargs):
+                raise agent.RunnerRemoved("등록되지 않은 러너입니다")
+
+        home = self.agent.config.home
+        self.agent.config.save()
+        self.agent.handle(self.two, start(2))
+        theirs = self.agent.jobs[job_id(2)]
+        removed_autostart = []
+        with mock.patch.object(agent, "remove_own_autostart", side_effect=removed_autostart.append):
+            self.two.api = Removed("b")
+            self.agent._serve(self.two)                          # returns: that server is done with us
+            self.assertEqual(theirs.stops, 1)
+            self.assertEqual([entry["url"] for entry in agent.Config(home).servers], ["https://one.example"])
+            self.assertEqual(self.agent.links, [self.one])
+            self.assertTrue(self.agent.running)
+            self.assertEqual(removed_autostart, [])
+            self.one.api = Removed("a")
+            self.agent._serve(self.one)                          # the last server: nothing left to serve
+            self.assertEqual(agent.Config(home).servers, [])
+            self.assertFalse(self.agent.running)
+            self.assertEqual(removed_autostart, [home])
+
+    def test_a_reinstalled_folder_is_not_forgotten_for_its_old_registration(self):
+        """install replaced the token while the old agent still ran; the server dropping the old
+        runner must not take the new registration with it."""
+        home = self.agent.config.home
+        self.two.api.token = "b"
+        self.agent.config.data["servers"][1]["token"] = "b-new"
+        self.agent.config.save()
+        with mock.patch.object(agent, "remove_own_autostart") as autostart:
+            self.agent.forget(self.two)                          # still holds the old token "b"
+        self.assertEqual([entry["token"] for entry in agent.Config(home).servers], ["a", "b-new"])
+        self.assertTrue(self.agent.running)
+        autostart.assert_not_called()
+
     def test_a_server_only_controls_its_own_jobs(self):
         self.agent.handle(self.one, start(1))
         job = self.agent.jobs[job_id(1)]
@@ -1212,12 +1284,14 @@ class SharedSlotTests(unittest.TestCase):
 
 class RegisterApi:
     registered = []
+    replaces = []
 
     def __init__(self, base_url, token):
         self.base_url, self.token = base_url.rstrip("/"), token
 
     def call(self, method, path, body=None, **kwargs):
         RegisterApi.registered.append((self.base_url, body["recommended_slots"]))
+        RegisterApi.replaces.append(body.get("replaces"))
         number = len(RegisterApi.registered)
         return {"runner_id": number, "token": "credential-%d" % number, "name": body["name"]}
 
@@ -1227,7 +1301,7 @@ class ServerListTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.saved = agent.Api, agent.choose_ffmpeg, agent.machine_info, agent._restart_service
-        agent.Api, RegisterApi.registered = RegisterApi, []
+        agent.Api, RegisterApi.registered, RegisterApi.replaces = RegisterApi, [], []
         agent.choose_ffmpeg = lambda config, explicit: ("/opt/ffmpeg", dict(CAPS))
         agent.machine_info = lambda: {"os": "test"}
         agent._restart_service = lambda *_args: None
@@ -1254,10 +1328,14 @@ class ServerListTests(unittest.TestCase):
                                           ("https://two.example", "credential-2")])
         # Both servers are told the device total, not a share of it.
         self.assertEqual(RegisterApi.registered, [("https://one.example", 3), ("https://two.example", 3)])
-        self.assertEqual(self.run_agent(*install, "--url", "https://one.example"), 1)     # already there
-        self.assertEqual(self.run_agent(*install, "--url", "https://one.example", "--force"), 0)
+        # Running the command again on a server it is already on registers anew (no --force since
+        # 0.6.1) and asks that server to drop the earlier runner, so it is not listed twice.
+        self.assertEqual(self.run_agent(*install, "--url", "https://one.example"), 0)
         self.assertEqual(self.servers(), [("https://one.example", "credential-3"),
                                           ("https://two.example", "credential-2")])
+        self.assertEqual(RegisterApi.replaces, [None, None, "credential-1"])
+        self.assertEqual(self.run_agent(*install, "--url", "https://one.example", "--force"), 0)
+        self.assertEqual(RegisterApi.replaces[-1], "credential-3")
 
     def test_one_server_can_be_removed_but_not_the_last(self):
         install = ("install", "--token", "shr_once", "--no-service")
@@ -1279,6 +1357,45 @@ class ServerListTests(unittest.TestCase):
             {"url": "https://one.example", "token": "old", "runner_id": 4, "name": "box"}])
         self.assertEqual((config.data["ffmpeg"], str(config.tmp_dir)), ("/opt/ffmpeg", "/work"))
         self.assertNotIn("token", config.data)
+
+
+class RunnerRemovedTests(unittest.TestCase):
+    def test_only_the_servers_own_signal_means_the_runner_was_deleted(self):
+        """A 401 from a proxy in front of the server must not make the agent forget the server."""
+        api = agent.Api("https://one.example", "t")
+        for marked, expected in ((True, agent.RunnerRemoved), (False, agent.Unauthorized)):
+            headers = http.client.HTTPMessage()
+            if marked:
+                headers[agent.RUNNER_STATE_HEADER] = "unknown"
+            api.request = lambda *args, **kwargs: (401, headers, b'{"detail": "x"}')
+            with self.assertRaises(agent.Unauthorized) as caught:
+                api.call("POST", "/transcode-agent/poll", {})
+            self.assertIs(type(caught.exception), expected)
+
+    def test_the_agent_removes_only_its_own_folders_autostart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home, other = Path(folder) / "mine", Path(folder) / "mine-old"        # a name that starts the same
+            with mock.patch.object(agent.platform, "system", return_value="Windows"), \
+                    mock.patch.object(agent, "_windows_autostart") as autostart:
+                for registered, removed in ((home, True), (other, False)):
+                    command = agent.subprocess.list2cmdline(["pythonw.exe", "agent.py", "run", "--dir", str(registered)])
+                    with mock.patch.object(agent, "windows_autostart_command", return_value=command):
+                        autostart.reset_mock()
+                        agent.remove_own_autostart(home)
+                        self.assertEqual(autostart.call_args_list, [mock.call(None)] if removed else [])
+            plist = Path(folder) / "agent.plist"
+            with mock.patch.object(agent.platform, "system", return_value="Darwin"), \
+                    mock.patch.object(agent, "_launch_agent_path", return_value=plist), \
+                    mock.patch.object(agent.subprocess, "call") as call, \
+                    mock.patch.object(agent.os, "getuid", return_value=501, create=True):
+                plist.write_text("<string>%s</string>" % agent._xml(str(other)))
+                agent.remove_own_autostart(home)
+                self.assertTrue(plist.exists())
+                call.assert_not_called()
+                plist.write_text("<string>%s</string>" % agent._xml(str(home)))
+                agent.remove_own_autostart(home)
+                self.assertFalse(plist.exists())           # gone before launchd could restart it
+                self.assertEqual(call.call_args[0][0][:2], ["launchctl", "bootout"])
 
 
 class WindowsSupportTests(unittest.TestCase):

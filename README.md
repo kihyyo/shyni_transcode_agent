@@ -366,6 +366,14 @@ Windows(PowerShell)는 `python3` 대신 `py`, 경로는 `"$HOME\shyni-transcoder
   돕니다(macOS·Linux 의 사용자 서비스와 같습니다). 자동 로그인을 켜 두면 재부팅 뒤에도 붙습니다.
 - **Windows 백신이 pythonw 나 ffmpeg 를 막을 때** — `<폴더>` 를 검사 예외에 넣으세요. 막히면
   `agent.log` 에 ffmpeg 시작 실패가 남습니다.
+- **Linux 에서 "bad unit file setting" 으로 서비스가 안 뜰 때** — 0.6.4 까지 만든 서비스 파일은
+  `WorkingDirectory` 를 따옴표로 묶어 systemd 가 거부합니다. 관리자 화면의 설치 명령을 다시
+  실행하거나 `service install` 을 다시 실행하면 새 형식으로 다시 씁니다. 0.6.4 에서 `update` 로
+  올린 경우에도 서비스 파일은 그대로라 이 방법이 필요합니다(0.6.6 부터는 `update` 가 다시 씁니다).
+
+  ```sh
+  sudo python3 /root/shyni-transcoder/agent/shyni_transcode_agent.py service install --dir /root/shyni-transcoder
+  ```
 
 ## 개발
 

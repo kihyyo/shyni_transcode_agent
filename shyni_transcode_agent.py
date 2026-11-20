@@ -65,7 +65,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.6.5"
+__version__ = "0.6.6"
 PROTOCOL_VERSION = 1
 # 이 파일이 공개된 곳. `update` 가 여기서 새 버전을 받는다.
 SOURCE_URL = os.environ.get(
@@ -4011,7 +4011,14 @@ def command_update(args) -> int:
         raise AgentError("받은 파일이 에이전트가 아닙니다: " + SOURCE_URL)
     os.replace(str(staged), str(current))
     print("%s → %s" % (__version__, version.split()[-1]))
-    _restart_service(Path(args.dir).expanduser().resolve())
+    home = Path(args.dir).expanduser().resolve()
+    if (platform.system() == "Linux" and _systemd_unit_path().is_file() and shutil.which("systemctl")
+            and str(home) in _systemd_unit_path().read_text(encoding="utf-8", errors="replace")):
+        # 서비스 파일은 받은 새 코드가 다시 쓴다(지금 도는 이 코드는 옛 버전이다). 0.6.4 까지의
+        # 서비스 파일은 WorkingDirectory 를 따옴표로 묶어 systemd 가 아예 띄우지 않았는데, 파일만
+        # 바꾸고 다시 시작하면 그 파일이 그대로 남았다.
+        return subprocess.call([sys.executable, str(current), "service", "install", "--dir", str(home)])
+    _restart_service(home)
     return 0
 
 

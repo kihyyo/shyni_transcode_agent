@@ -114,6 +114,31 @@ class SpecTests(unittest.TestCase):
         self.assertEqual(dict(line.split("=", 1) for line in agent.systemd_unit_text(
             ["x"], Path("/home/u/a"), system_wide=False).splitlines() if "=" in line)["WantedBy"], "default.target")
 
+    def test_update_lets_the_new_code_rewrite_the_linux_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            current = Path(tmp) / "agent" / "shyni_transcode_agent.py"
+            current.parent.mkdir()
+            current.write_text("# old\n")
+            home = Path(tmp).resolve()             # the installer writes the resolved folder
+            unit = Path(tmp) / "shyni-transcode-agent.service"
+            unit.write_text('WorkingDirectory="%s"\n' % home)
+
+            def download(url, target):
+                Path(target).write_text('import sys\nprint("shyni-transcode-agent 9.9.9")\n')
+
+            calls = []
+            with mock.patch.object(agent, "__file__", str(current)), \
+                    mock.patch.object(agent, "_download", download), \
+                    mock.patch.object(agent.platform, "system", return_value="Linux"), \
+                    mock.patch.object(agent, "_systemd_unit_path", return_value=unit), \
+                    mock.patch.object(agent.shutil, "which", return_value="/bin/systemctl"), \
+                    mock.patch.object(agent.subprocess, "call", side_effect=lambda args: calls.append(args) or 0), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(agent.command_update(SimpleNamespace(dir=str(home))), 0)
+            self.assertIn("9.9.9", current.read_text())
+            # 옛 코드가 다시 시작만 하면 깨진 서비스 파일이 남는다 — 새 파일이 service install 로 다시 쓴다.
+            self.assertEqual(calls, [[sys.executable, str(current.resolve()), "service", "install", "--dir", str(home)]])
+
     def test_video_output_is_always_8_bit_4_2_0(self):
         # 10비트 원본을 그대로 넘기면 h264_nvenc 는 시작하지 못하고(RTX 3060 Ti), libx264 는
         # High 10 을 낸다 — 출력 직전에 늘 8비트 4:2:0 으로 바꾼다.

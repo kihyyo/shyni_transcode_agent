@@ -101,6 +101,19 @@ class SpecTests(unittest.TestCase):
                 self.assertEqual(agent.recommended_slots({"hw_encoder": "h264_nvenc", "hw_decode": {"codecs": {}}}), cpu)
                 self.assertEqual(agent.recommended_slots({"hw_encoder": None, "video_encoder": "libx264"}), software)
 
+    def test_systemd_unit_has_an_unquoted_working_directory(self):
+        # A quoted WorkingDirectory is "not absolute" to systemd; the unit then never starts.
+        text = agent.systemd_unit_text(
+            ["/usr/bin/python3", "/root/shyni transcoder/agent/shyni_transcode_agent.py", "run", "--dir", "/root/50%"],
+            Path("/root/50%"), system_wide=True)
+        lines = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+        self.assertEqual(lines["WorkingDirectory"], "/root/50%%")
+        self.assertEqual(lines["ExecStart"], '"/usr/bin/python3" "/root/shyni transcoder/agent/shyni_transcode_agent.py" '
+                                             '"run" "--dir" "/root/50%%"')
+        self.assertEqual(lines["WantedBy"], "multi-user.target")
+        self.assertEqual(dict(line.split("=", 1) for line in agent.systemd_unit_text(
+            ["x"], Path("/home/u/a"), system_wide=False).splitlines() if "=" in line)["WantedBy"], "default.target")
+
     def test_video_output_is_always_8_bit_4_2_0(self):
         # 10비트 원본을 그대로 넘기면 h264_nvenc 는 시작하지 못하고(RTX 3060 Ti), libx264 는
         # High 10 을 낸다 — 출력 직전에 늘 8비트 4:2:0 으로 바꾼다.

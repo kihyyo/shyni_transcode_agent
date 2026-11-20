@@ -65,7 +65,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.6.4"
+__version__ = "0.6.5"
 PROTOCOL_VERSION = 1
 # 이 파일이 공개된 곳. `update` 가 여기서 새 버전을 받는다.
 SOURCE_URL = os.environ.get(
@@ -4135,14 +4135,7 @@ def command_service(args) -> int:
             print("서비스 제거됨")
             return 0
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "[Unit]\nDescription=Shyni transcode agent\nAfter=network-online.target\n"
-            "Wants=network-online.target\n\n[Service]\nExecStart=%s\nRestart=always\nRestartSec=5\n"
-            "WorkingDirectory=%s\n\n[Install]\nWantedBy=%s\n" % (
-                " ".join(_quote(item) for item in command), _quote(str(home)),
-                "multi-user.target" if os.geteuid() == 0 else "default.target"),
-            encoding="utf-8",
-        )
+        path.write_text(systemd_unit_text(command, home, system_wide=os.geteuid() == 0), encoding="utf-8")
         _systemctl("daemon-reload")
         # 이미 돌고 있으면 새 설정(추가한 서버 등)을 읽도록 다시 시작한다.
         code = _systemctl("enable", SYSTEMD_UNIT) or _systemctl("restart", SYSTEMD_UNIT)
@@ -4182,6 +4175,21 @@ def _xml(value: str) -> str:
 
 def _quote(value: str) -> str:
     return '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def systemd_unit_text(command: list, home: Path, system_wide: bool) -> str:
+    """systemd 서비스 파일. ExecStart 는 인자마다 따옴표로 묶지만 WorkingDirectory 는 따옴표를 받지
+    않는다 — 묶으면 "path is not absolute" 로 서비스가 아예 뜨지 않았다(0.6.4 까지, root 설치에서 확인).
+    두 곳 모두 % 는 systemd 지정자라 %% 로 적는다."""
+    def unit_value(text: str) -> str:
+        return text.replace("%", "%%")
+    return (
+        "[Unit]\nDescription=Shyni transcode agent\nAfter=network-online.target\n"
+        "Wants=network-online.target\n\n[Service]\nExecStart=%s\nRestart=always\nRestartSec=5\n"
+        "WorkingDirectory=%s\n\n[Install]\nWantedBy=%s\n" % (
+            " ".join(unit_value(_quote(str(item))) for item in command), unit_value(str(home)),
+            "multi-user.target" if system_wide else "default.target")
+    )
 
 
 def remove_own_autostart(home: Path) -> None:

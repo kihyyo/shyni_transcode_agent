@@ -91,6 +91,16 @@ class SpecTests(unittest.TestCase):
         self.assertTrue(args[-1].startswith("/work/job/"))
         self.assertIn("min(ih,480)", args[args.index("-vf") + 1])
 
+    def test_recommended_slots_follow_who_decodes(self):
+        gpu_decode = {"hwaccel": "vaapi", "codecs": {"h264": [8], "hevc": [8, 10]}}
+        for cores, gpu, cpu, software in ((2, 4, 2, 1), (4, 6, 4, 2), (6, 8, 6, 3), (16, 12, 12, 4)):
+            with mock.patch.object(agent, "_performance_cores", return_value=cores), self.subTest(cores=cores):
+                # 디코딩까지 GPU 면 코어 + 2, 디코딩을 CPU 가 하면(J5005 의 HEVC 10비트) 코어 수만큼.
+                self.assertEqual(agent.recommended_slots({"hw_encoder": "h264_vaapi", "hw_decode": gpu_decode}), gpu)
+                self.assertEqual(agent.recommended_slots({"hw_encoder": "h264_vaapi", "hw_decode": None}), cpu)
+                self.assertEqual(agent.recommended_slots({"hw_encoder": "h264_nvenc", "hw_decode": {"codecs": {}}}), cpu)
+                self.assertEqual(agent.recommended_slots({"hw_encoder": None, "video_encoder": "libx264"}), software)
+
     def test_video_output_is_always_8_bit_4_2_0(self):
         # 10비트 원본을 그대로 넘기면 h264_nvenc 는 시작하지 못하고(RTX 3060 Ti), libx264 는
         # High 10 을 낸다 — 출력 직전에 늘 8비트 4:2:0 으로 바꾼다.

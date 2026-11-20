@@ -65,7 +65,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.6.3"
+__version__ = "0.6.4"
 PROTOCOL_VERSION = 1
 # 이 파일이 공개된 곳. `update` 가 여기서 새 버전을 받는다.
 SOURCE_URL = os.environ.get(
@@ -942,12 +942,16 @@ def _performance_cores() -> int:
 def recommended_slots(caps: dict) -> int:
     """이 기기에서 동시에 돌릴 만한 변환 수.
 
-    H/W 인코더는 인코딩이 가볍고 디코드·스케일만 CPU 몫이라 코어 수에 2를 더한다
-    (M1 = 고성능 4코어 → 6). S/W(libx264)는 1080p 실시간 한 편에 물리 2코어쯤 쓴다고 본다.
+    H/W 인코더는 인코딩이 가볍다. 디코딩도 GPU 가 하면 코어 수에 2를 더하고(M1 = 고성능 4코어 → 6),
+    디코딩을 CPU 가 하면(GPU 디코딩이 없거나 시험에서 꺼짐) 코어 수만큼만 둔다 — 1080p HEVC 10비트를
+    CPU 로 풀면 J5005(4코어)는 동시 2편(실시간 1.6배)이 한계였고 4편은 0.8배로 끊겼다(2026-11-20).
+    S/W(libx264)는 1080p 실시간 한 편에 물리 2코어쯤 쓴다고 본다.
     """
     cores = _performance_cores()
     if caps.get("hw_encoder"):
-        return max(2, min(cores + 2, 12))
+        if (caps.get("hw_decode") or {}).get("codecs"):
+            return max(2, min(cores + 2, 12))
+        return max(1, min(cores, 12))
     return max(1, min(cores // 2, 4))
 
 

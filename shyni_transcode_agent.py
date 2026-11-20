@@ -65,7 +65,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 PROTOCOL_VERSION = 1
 # 이 파일이 공개된 곳. `update` 가 여기서 새 버전을 받는다.
 SOURCE_URL = os.environ.get(
@@ -639,14 +639,17 @@ def _qsv_input_args(child_device) -> list:
     ]
 
 
-def hw_decode_check_args(hwaccel: str, device, depth: int, path: str) -> list:
+def hw_decode_check_args(hwaccel: str, device, depth: int, path: str, pipeline: str = "download") -> list:
     """프레임을 GPU 메모리로 받아 hwdownload 로 내려받는다 — 소프트웨어로 풀었으면 여기서 실패한다.
 
-    QSV 는 실제 변환처럼 scale_qsv 로 줄이고 8비트로 바꾼 뒤 내려받는다. 디코딩은 되는데 축소
-    출력을 못 만드는 기기(구형 드라이버의 D3D11)를 여기서 거른다."""
+    QSV 와 GPU 안에서 끝내는 CUDA 는 실제 변환처럼 GPU 필터로 줄이고 8비트로 바꾼 뒤 내려받는다.
+    디코딩은 되는데 축소 출력을 못 만드는 기기(구형 드라이버의 D3D11)를 여기서 거른다."""
     if hwaccel == "qsv":
         return ["-v", "error", *_qsv_input_args(device), "-i", path,
                 "-vf", "scale_qsv=w=320:h=180:format=nv12,hwdownload,format=nv12", "-f", "null", "-"]
+    if hwaccel == "cuda" and pipeline == "gpu":
+        return ["-v", "error", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", path,
+                "-vf", "scale_cuda=w=320:h=180:format=nv12,hwdownload,format=nv12", "-f", "null", "-"]
     args = ["-v", "error"]
     if device:
         args += ["-hwaccel_device", device]
@@ -657,12 +660,19 @@ def hw_decode_check_args(hwaccel: str, device, depth: int, path: str) -> list:
     ]
 
 
-def hw_decode_pipeline(caps: dict, hwaccel: str, device) -> str:
-    """VAAPI·QSV 는 같은 계열의 인코더가 있으면 GPU 안에서 끝낸다(내려받기는 너무 느리다)."""
+def hw_decode_pipeline(caps: dict, hwaccel: str, device, filters: str = "") -> str:
+    """VAAPI·QSV 는 같은 계열의 인코더가 있으면 GPU 안에서 끝낸다(내려받기는 너무 느리다).
+
+    NVIDIA(CUDA)는 NVENC 와 scale_cuda(filters = `ffmpeg -filters` 출력)가 있으면 GPU 안에서 끝낸다.
+    내려받아 CPU 로 줄이면 CPU 를 30% 남짓만 덜 써 켜고 끄는 시험이 경계선에 걸렸고(5번 중 1번 켜짐),
+    GPU 에서 줄이면 1080p HEVC 10비트 → 720p 동시 8편이 실시간 1.5배 → 3.1배, CPU 합 68초 → 6초였다
+    (RTX 3060 Ti + i7-8700, 2026-11-20). 그 밖에는 내려받는다."""
     if hwaccel == "vaapi":
         return "gpu" if caps.get("hw_encoder") == "h264_vaapi" and caps.get("vaapi_device") == device else ""
     if hwaccel == "qsv":
         return "gpu" if caps.get("hw_encoder") == "h264_qsv" else ""
+    if hwaccel == "cuda" and caps.get("hw_encoder") == "h264_nvenc" and " scale_cuda " in filters:
+        return "gpu"
     return "download"
 
 
@@ -748,14 +758,17 @@ def probe_hw_decode(ffmpeg: str, caps: dict):
         bench = os.path.join(tmp, "bench.mkv")
         if run_ffmpeg(ffmpeg, hw_decode_benchmark_sample_args(bench), timeout=30)[0] != 0:
             return None
-        for hwaccel, device, driver in _hw_decode_candidates(caps):
-            pipeline = hw_decode_pipeline(caps, hwaccel, device)
+        candidates = _hw_decode_candidates(caps)
+        filters = run_ffmpeg(ffmpeg, ["-hide_banner", "-filters"])[1] \
+            if any(hwaccel == "cuda" for hwaccel, _device, _driver in candidates) else ""
+        for hwaccel, device, driver in candidates:
+            pipeline = hw_decode_pipeline(caps, hwaccel, device, filters)
             if not pipeline or time.monotonic() > deadline:
                 continue
             env = encoder_environment({"vaapi_driver": driver})
             codecs = {}
             for (codec, depth), path in samples.items():
-                if run_ffmpeg(ffmpeg, hw_decode_check_args(hwaccel, device, depth, path), env=env)[0] == 0:
+                if run_ffmpeg(ffmpeg, hw_decode_check_args(hwaccel, device, depth, path, pipeline), env=env)[0] == 0:
                     codecs.setdefault(codec, []).append(depth)
             if "h264" not in codecs:
                 continue
@@ -1011,7 +1024,7 @@ def build_transcode_args(
         args += _qsv_input_args(hw_decode.get("device"))
     elif mode == MODE_VIDEO and hw_decode:
         # "download": 프레임을 내려받아 필터·인코더가 그대로 동작한다.
-        # "gpu"(VAAPI·QSV): 프레임을 GPU 에 둔 채 GPU 필터로 줄여 같은 장치에서 인코딩한다.
+        # "gpu"(VAAPI·QSV·CUDA): 프레임을 GPU 에 둔 채 GPU 필터로 줄여 같은 장치에서 인코딩한다.
         if hw_decode.get("device"):
             args += ["-hwaccel_device", hw_decode["device"]]
         args += ["-hwaccel", hw_decode["hwaccel"]]
@@ -1034,7 +1047,7 @@ def build_transcode_args(
             max_width = VIDEO_RESOLUTION_WIDTHS.get(max_height, max_height * 16 // 9)
             scale = ("w='min(iw,%d)':h='min(ih,%d)':"
                      "force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12" % (max_width, max_height))
-        args += ["-vf", ("scale_qsv=" if qsv_frames else "scale_vaapi=") + scale]
+        args += ["-vf", {"qsv": "scale_qsv=", "cuda": "scale_cuda="}.get(hw_decode["hwaccel"], "scale_vaapi=") + scale]
     if mode == MODE_VIDEO:
         filters: list = []
         if max_height and not gpu_frames:
@@ -1049,11 +1062,12 @@ def build_transcode_args(
             pass                                  # 프레임이 이미 GPU 의 nv12 다
         elif vaapi_encoder:
             filters.append("format=nv12,hwupload")
-        elif video_encoder.endswith(("_videotoolbox", "_amf")) or output_codec != "h264":
-            # HEVC·AV1 은 어느 인코더든 8비트 4:2:0 으로 고정한다(10비트 원본이 Main 10 으로
-            # 나가지 않게 — 서버는 재생 기기가 그 코덱을 푼다는 것만 안다). AMF 는 10비트(P010)
-            # 프레임을 받으면 H.264 도 실패하므로 같이 8비트로 넘긴다.
-            filters.append("format=nv12")
+        else:
+            # 출력은 어느 코덱·인코더든 8비트 4:2:0 으로 고정한다 — 서버는 재생 기기가 그 코덱을
+            # 푼다는 것만 안다. 10비트(또는 4:2:2·4:4:4) 원본을 그대로 넘기면 libx264 는 High 10
+            # (애플 기기·브라우저가 못 푼다)을, HEVC·AV1 은 Main 10 을 내고, h264_nvenc·AMF 는
+            # 시작하지 못한다(10비트 H.264 인코딩 없음 — RTX 3060 Ti 실측, 2026-11-20).
+            filters.append("format=yuv420p" if video_encoder == "libx264" else "format=nv12")
         if filters:
             args += ["-vf", ",".join(filters)]
         bitrate = _video_bitrate_for(max_height, output_codec)

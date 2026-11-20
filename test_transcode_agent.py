@@ -91,6 +91,22 @@ class SpecTests(unittest.TestCase):
         self.assertTrue(args[-1].startswith("/work/job/"))
         self.assertIn("min(ih,480)", args[args.index("-vf") + 1])
 
+    def test_video_output_is_always_8_bit_4_2_0(self):
+        # 10비트 원본을 그대로 넘기면 h264_nvenc 는 시작하지 못하고(RTX 3060 Ti), libx264 는
+        # High 10 을 낸다 — 출력 직전에 늘 8비트 4:2:0 으로 바꾼다.
+        cases = (("libx264", "h264", "format=yuv420p"), ("h264_nvenc", "h264", "format=nv12"),
+                 ("h264_qsv", "h264", "format=nv12"), ("h264_amf", "h264", "format=nv12"),
+                 ("h264_videotoolbox", "h264", "format=nv12"), ("hevc_nvenc", "hevc", "format=nv12"),
+                 ("av1_nvenc", "av1", "format=nv12"), ("h264_vaapi", "h264", "format=nv12,hwupload"))
+        cuda = {"hwaccel": "cuda", "device": None, "pipeline": "download"}
+        for encoder, codec, last in cases:
+            for options in ({}, {"hdr": True}, {"hw_decode": cuda}, {"max_height": None}):
+                args = agent.build_transcode_args(
+                    "ffmpeg", "/media/a.mkv", "video", **{"max_height": 720, **options},
+                    video_encoder=encoder, output_codec=codec, video_codec="hevc", vaapi_device="/dev/dri/renderD128")
+                with self.subTest(encoder=encoder, options=options):
+                    self.assertTrue(args[args.index("-vf") + 1].endswith(last))
+
 
 class FakeApi:
     host = "127.0.0.1"
@@ -1488,6 +1504,70 @@ class WindowsSupportTests(unittest.TestCase):
         # HDR 은 톤매핑(CPU 필터)이 필요해 S/W 로 푼다.
         self.assertIsNone(agent.hw_decode_for({"hw_decode": {"hwaccel": "qsv", "device": "d3d11va", "pipeline": "gpu",
                                                              "codecs": {"hevc": [10]}}}, "hevc", 10, hdr=True))
+
+    def test_nvidia_decodes_scales_and_encodes_on_the_gpu_with_cuda(self):
+        nvenc = {"hw_encoder": "h264_nvenc", "video_encoder": "h264_nvenc"}
+        filters = " ... scale_cuda        V->V       GPU accelerated video resizer\n"
+        self.assertEqual(agent.hw_decode_pipeline(nvenc, "cuda", None, filters), "gpu")
+        # scale_cuda 가 없는 ffmpeg, NVENC 가 아닌 인코더는 지금처럼 내려받는다.
+        self.assertEqual(agent.hw_decode_pipeline(nvenc, "cuda", None, " scale "), "download")
+        self.assertEqual(agent.hw_decode_pipeline({"hw_encoder": "h264_vaapi"}, "cuda", None, filters), "download")
+
+        check = agent.hw_decode_check_args("cuda", None, 10, "/tmp/hevc-10.mkv", "gpu")
+        self.assertEqual(check[check.index("-hwaccel_output_format") + 1], "cuda")
+        self.assertEqual(check[check.index("-vf") + 1], "scale_cuda=w=320:h=180:format=nv12,hwdownload,format=nv12")
+        download = agent.hw_decode_check_args("cuda", None, 10, "/tmp/hevc-10.mkv")
+        self.assertEqual(download[download.index("-vf") + 1], "hwdownload,format=p010le")
+
+        caps = {"hw_decode": {"hwaccel": "cuda", "device": None, "pipeline": "gpu", "codecs": {"hevc": [8, 10]}}}
+        decode = agent.hw_decode_for(caps, "hevc", 10)
+        self.assertEqual(decode, {"hwaccel": "cuda", "device": None, "pipeline": "gpu"})
+        for encoder, codec in (("h264_nvenc", "h264"), ("hevc_nvenc", "hevc")):
+            args = agent.build_transcode_args("ffmpeg", "http://127.0.0.1:1/media", "video", max_height=720,
+                                              start_ms=5000, video_encoder=encoder, output_codec=codec, hw_decode=decode)
+            source = args.index("-i")
+            self.assertEqual(args[4:source], ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-ss", "5.000"])
+            [video_filter] = [args[i + 1] for i, value in enumerate(args) if value == "-vf"]
+            self.assertEqual(video_filter, "scale_cuda=w='min(iw,1280)':h='min(ih,720)':"
+                                           "force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12")
+            self.assertEqual(args[args.index("-c:v") + 1], encoder)
+        unscaled = agent.build_transcode_args("ffmpeg", "http://127.0.0.1:1/media", "video",
+                                              video_encoder="h264_nvenc", hw_decode=decode)
+        self.assertEqual(unscaled[unscaled.index("-vf") + 1], "scale_cuda=format=nv12")
+        # HDR 은 톤매핑(CPU 필터)이 필요해 S/W 로 푼다.
+        self.assertIsNone(agent.hw_decode_for(caps, "hevc", 10, hdr=True))
+
+    def test_nvidia_probe_checks_the_gpu_scaler_and_keeps_frames_on_the_gpu(self):
+        commands, measured = [], []
+
+        def fake_run(ffmpeg, args, timeout=15.0, env=None, cwd=None):
+            commands.append(args)
+            if args[:2] == ["-hide_banner", "-encoders"]:
+                return 0, " V..... libx264  V..... libx265 "
+            if args[:2] == ["-hide_banner", "-filters"]:
+                return 0, filters_out
+            if "-hwaccel" not in args:                      # 시험 영상 만들기
+                Path(args[-1]).write_bytes(b"sample")
+            return 0, ""
+
+        def fake_measure(args, env, timeout=30.0):
+            measured.append(args)
+            return (0, 1.0, 0.2) if "-hwaccel" in args else (0, 1.0, 1.0)
+
+        caps = {"video_encoder": "h264_nvenc", "hw_encoder": "h264_nvenc"}
+        with mock.patch.object(agent, "run_ffmpeg", fake_run), \
+                mock.patch.object(agent, "_measure_ffmpeg", fake_measure), \
+                mock.patch.object(agent.platform, "system", return_value="Windows"), \
+                mock.patch.object(agent, "windows_gpus", return_value=[("nvidia", "NVIDIA GeForce RTX 3060 Ti")]):
+            for filters_out, pipeline in ((" T.. scale_cuda  V->V  GPU accelerated video resizer ", "gpu"),
+                                          (" ..C scale  V->V  Scale the input video size ", "download")):
+                commands.clear(), measured.clear()
+                decode = agent.probe_hw_decode("ffmpeg", caps)
+                self.assertEqual(decode["pipeline"], pipeline)
+                self.assertEqual(decode["codecs"], {"h264": [8], "hevc": [8, 10]})
+                checks = [args for args in commands if "-hwaccel" in args]
+                self.assertTrue(checks and all(("scale_cuda=" in " ".join(args)) == (pipeline == "gpu") for args in checks))
+                self.assertEqual(("scale_cuda=" in " ".join(measured[1])), pipeline == "gpu")   # 실제 480p 명령
 
     def test_qsv_scaling_keeps_the_picture_shape(self):
         """scale_qsv 에는 force_original_aspect_ratio 가 없어 크기를 식으로 준다 — 같은 상자에 맞춘다."""

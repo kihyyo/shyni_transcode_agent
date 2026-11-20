@@ -1429,6 +1429,81 @@ class WindowsSupportTests(unittest.TestCase):
             self.assertEqual(args[args.index("-maxrate") + 1], args[args.index("-b:v") + 1])
         self.assertEqual(agent.ENCODER_ALIASES["amf"], "h264_amf")
 
+    def test_the_subtitle_probe_runs_in_its_output_folder(self):
+        """Windows ffmpeg writes the fMP4 init file into the current folder, not next to the playlist."""
+        seen = []
+
+        def run(ffmpeg, args, timeout=15.0, env=None, cwd=None):
+            if "rawvideo" in args:
+                Path(args[-1]).write_bytes(b"nut")
+                return 0, ""
+            seen.append((Path(args[-1]).parent, cwd))
+            out = Path(cwd or os.getcwd())                      # where this ffmpeg would put init.mp4
+            (out / "init.mp4").write_bytes(b"init")
+            (Path(args[-1]).parent / "index.m3u8").write_text("#EXTM3U\n")
+            (Path(args[-1]).parent / "master.m3u8").write_text("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nindex.m3u8\n")
+            return 0, ""
+
+        caps = {"video_encoder": "h264_qsv", "video_encoders": {"h264": "h264_qsv", "hevc": "hevc_qsv"}}
+        with mock.patch.object(agent, "run_ffmpeg", side_effect=run):
+            self.assertTrue(agent.probe_hls_fmp4_subtitles("ffmpeg", caps))
+        [(playlist_folder, cwd)] = seen
+        self.assertEqual(str(playlist_folder), cwd)
+
+    def test_intel_decodes_scales_and_encodes_on_the_gpu_with_qsv(self):
+        qsv_caps = {"hw_encoder": "h264_qsv", "video_encoder": "h264_qsv"}
+        with mock.patch.object(agent.platform, "system", return_value="Windows"):
+            with mock.patch.object(agent, "windows_gpus", return_value=[("intel", "Intel(R) UHD Graphics 630")]):
+                # D3D11 위의 QSV 하나. 내려받는 방식(d3d11va)과 모니터가 꺼지면 안 되는 DXVA2 는 쓰지 않는다.
+                self.assertEqual(agent._hw_decode_candidates(qsv_caps), [("qsv", "d3d11va", None)])
+                self.assertEqual(agent._hw_decode_candidates({"hw_encoder": None}), [])
+            with mock.patch.object(agent, "windows_gpus", return_value=[("nvidia", "RTX"), ("intel", "UHD 770")]):
+                self.assertEqual(agent._hw_decode_candidates({"hw_encoder": "h264_nvenc"}), [("cuda", None, None)])
+        self.assertEqual(agent.hw_decode_pipeline(qsv_caps, "qsv", "d3d11va"), "gpu")
+        self.assertEqual(agent.hw_decode_pipeline({"hw_encoder": "libx264"}, "qsv", "d3d11va"), "")
+
+        check = agent.hw_decode_check_args("qsv", "d3d11va", 10, "/tmp/hevc-10.mkv")
+        self.assertEqual(check[check.index("-init_hw_device") + 1], "qsv=hw,child_device_type=d3d11va")
+        self.assertEqual(check[check.index("-hwaccel_output_format") + 1], "qsv")
+        # 축소 출력까지 만들어 본다 — D3D11 에서 디코딩만 되고 scale_qsv 가 실패하는 기기를 거른다.
+        self.assertEqual(check[check.index("-vf") + 1], "scale_qsv=w=320:h=180:format=nv12,hwdownload,format=nv12")
+
+        decode = agent.hw_decode_for({"hw_decode": {"hwaccel": "qsv", "device": "d3d11va", "pipeline": "gpu",
+                                                    "codecs": {"hevc": [8, 10]}}}, "hevc", 10)
+        self.assertEqual(decode, {"hwaccel": "qsv", "device": "d3d11va", "pipeline": "gpu"})
+        for encoder, codec in (("h264_qsv", "h264"), ("hevc_qsv", "hevc")):
+            args = agent.build_transcode_args("ffmpeg", "http://127.0.0.1:1/media", "video", max_height=720,
+                                              video_encoder=encoder, output_codec=codec, hw_decode=decode)
+            source = args.index("-i")
+            self.assertEqual(args[1:source][3:], [
+                "-init_hw_device", "qsv=hw,child_device_type=d3d11va", "-filter_hw_device", "hw",
+                "-hwaccel", "qsv", "-hwaccel_device", "hw", "-hwaccel_output_format", "qsv"])
+            [video_filter] = [args[i + 1] for i, value in enumerate(args) if value == "-vf"]
+            self.assertTrue(video_filter.startswith("scale_qsv=") and video_filter.endswith(":format=nv12"))
+            self.assertNotIn("hwupload", video_filter)
+            self.assertEqual(args[args.index("-c:v") + 1], encoder)
+        unscaled = agent.build_transcode_args("ffmpeg", "http://127.0.0.1:1/media", "video",
+                                              video_encoder="h264_qsv", hw_decode=decode)
+        self.assertEqual(unscaled[unscaled.index("-vf") + 1], "scale_qsv=format=nv12")
+        # HDR 은 톤매핑(CPU 필터)이 필요해 S/W 로 푼다.
+        self.assertIsNone(agent.hw_decode_for({"hw_decode": {"hwaccel": "qsv", "device": "d3d11va", "pipeline": "gpu",
+                                                             "codecs": {"hevc": [10]}}}, "hevc", 10, hdr=True))
+
+    def test_qsv_scaling_keeps_the_picture_shape(self):
+        """scale_qsv 에는 force_original_aspect_ratio 가 없어 크기를 식으로 준다 — 같은 상자에 맞춘다."""
+        decode = {"hwaccel": "qsv", "device": "d3d11va", "pipeline": "gpu"}
+        args = agent.build_transcode_args("ffmpeg", "http://127.0.0.1:1/media", "video", max_height=720,
+                                          video_encoder="h264_qsv", hw_decode=decode)
+        options = dict(part.split("=", 1) for part in args[args.index("-vf") + 1][len("scale_qsv="):].split(":"))
+
+        def evaluate(expression, iw, ih):
+            return eval(expression.strip("'"), {"min": min, "trunc": int, "iw": iw, "ih": ih})
+
+        for (iw, ih), expected in (((1920, 1080), (1280, 720)), ((1920, 800), (1280, 532)),
+                                   ((1440, 1080), (960, 720)), ((1280, 720), (1280, 720)),
+                                   ((720, 480), (720, 480)), ((1920, 1088), (1270, 720))):
+            self.assertEqual((evaluate(options["w"], iw, ih), evaluate(options["h"], iw, ih)), expected, (iw, ih))
+
     def test_pause_freezes_ffmpeg_once_per_change(self):
         calls = []
         job = SimpleNamespace(proc=SimpleNamespace(pid=4242, poll=lambda: None), _suspended=False)

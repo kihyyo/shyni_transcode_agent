@@ -65,7 +65,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 PROTOCOL_VERSION = 1
 # 이 파일이 공개된 곳. `update` 가 여기서 새 버전을 받는다.
 SOURCE_URL = os.environ.get(
@@ -160,9 +160,9 @@ PROXY_UPLOAD_HINT = (
 
 
 # ══ 변환 파이프라인 ═══════════════════════════════════════════════════
-# Shyni 서버의 app/services/transcoder.py 와 같은 ffmpeg 명령을 만들어야 한다 — 같은 원본이
-# 서버에서 변환되든 이 기기에서 변환되든 재생기가 받는 결과가 같도록. 서버 저장소의
-# tests/test_transcode_agent_parity.py 가 두 구현의 출력을 맞대어 검사한다.
+# Shyni 서버도 이 파일을 그대로 불러 쓴다(서버 저장소의 server/app/services/ 에 있는 이 파일이
+# 원본이다). 같은 원본이 서버에서 변환되든 이 기기에서 변환되든 재생기가 받는 결과가 같다.
+# 그래서 이 부분(명령 구성·인코더 실측·하드웨어 디코딩 판정)은 서버의 Python 3.12 에서도 돈다.
 MODE_REMUX = "remux"    # 비디오/오디오 copy — 컨테이너만 교체
 MODE_AUDIO = "audio"    # 비디오 copy + 오디오 AAC
 MODE_VIDEO = "video"    # 비디오 재인코딩(다운스케일/톤매핑)
@@ -206,8 +206,7 @@ VIDEO_BITRATE_SCALE = {"h264": (1, 1), "hevc": (2, 3), "av1": (3, 5)}
 # fMP4 초기화 구간에서 그 코덱의 디코더 설정이 들어 있는 상자.
 CODEC_CONFIG_BOXES = {"h264": b"avcC", "hevc": b"hvcC", "av1": b"av1C"}
 # 하드웨어 디코딩: 코덱·비트 깊이별로 이 기기가 실제로 풀어 본 것만 하드웨어로 푼다. 못 푸는
-# 형식에 -hwaccel 을 걸면 ffmpeg 은 소프트웨어로 넘어가지 않고 실패한다(M1 의 AV1). 서버의
-# transcoder.py 와 같은 값이다(test_transcode_agent_parity).
+# 형식에 -hwaccel 을 걸면 ffmpeg 은 소프트웨어로 넘어가지 않고 실패한다(M1 의 AV1).
 HW_DECODE_PROBES = (
     ("h264", 8), ("hevc", 8), ("hevc", 10), ("vp9", 8), ("vp9", 10), ("av1", 8), ("av1", 10),
 )
@@ -218,8 +217,13 @@ HW_DECODE_SAMPLE_ENCODERS = {
     "av1": (("libsvtav1", ("-preset", "12")), ("libaom-av1", ("-cpu-used", "8", "-usage", "realtime"))),
 }
 HW_DECODE_OUTPUT_FORMATS = {
-    "videotoolbox": "videotoolbox_vld", "cuda": "cuda", "vaapi": "vaapi", "d3d11va": "d3d11",
+    "videotoolbox": "videotoolbox_vld", "cuda": "cuda", "vaapi": "vaapi", "d3d11va": "d3d11", "qsv": "qsv",
 }
+# Windows 의 QSV 는 D3D11 위에 만든다. 구형 드라이버(UHD 630, 31.0.101.2140)는 D3D11 위에서
+# scale_qsv 의 출력 텍스처를 못 만들어(80070057) 시험에서 빠지고 S/W 로 푼다. DXVA2(D3D9) 위에서는
+# 되지만 모니터가 꺼지거나 절전으로 끊기면(Windows 가 화면을 "WinDisc" 로 본다) 장치를 못 만들어
+# 쓰지 않는다 — 변환 PC 는 대개 화면을 끈 채 돈다(2026-11-20 실측).
+WINDOWS_QSV_CHILD_DEVICE = "d3d11va"
 HW_DECODE_PROBE_TIMEOUT_SEC = 60
 # 실제 변환으로 시험해 소프트웨어 디코딩보다 CPU 를 이만큼 덜 쓰고, 이보다 느리지 않을 때만 쓴다.
 # 프레임을 GPU 에서 내려받는 비용이 기기마다 크게 달라서다(M1 은 이득, Intel 내장 GPU 는 손해).
@@ -255,11 +259,11 @@ def output_encoders(caps: dict) -> dict:
     return found if "h264" in found else {}
 
 
-def run_ffmpeg(ffmpeg: str, args: list, timeout: float = 15.0, env=None) -> tuple:
+def run_ffmpeg(ffmpeg: str, args: list, timeout: float = 15.0, env=None, cwd=None) -> tuple:
     try:
         done = subprocess.run(
             [ffmpeg, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL, timeout=timeout, env=env, **POPEN_FLAGS,
+            stdin=subprocess.DEVNULL, timeout=timeout, env=env, cwd=cwd, **POPEN_FLAGS,
         )
     except subprocess.TimeoutExpired:
         return -1, "timeout"
@@ -545,9 +549,22 @@ def _smoke_test_encoder(ffmpeg: str, encoder: str, vaapi_device=None, vaapi_driv
         passed = code == 0 and _fmp4_has_codec_config(output_path, codec)
     if not passed:
         lines = [line.strip() for line in output.splitlines() if line.strip()]
-        detail = " | ".join(dict.fromkeys(lines[:2] + lines[-2:]))[:400] or "exit=%s" % code
+        selected = lines[:2] + (lines[-2:] if len(lines) > 2 else [])
+        if code == 0:
+            # 끝은 났는데 디코더 설정이 비었다 — 드라이버 경고("No global header will be written" 등)가 원인이다.
+            selected = ["fMP4 출력에 %s(디코더 설정)가 없음" % CODEC_CONFIG_BOXES[codec].decode(), *selected]
+        detail = " | ".join(dict.fromkeys(selected))[:600] or "exit=%s" % code
         log("인코더 시험 실패: %s: %s" % (encoder, detail))
     return passed
+
+
+def _encoder_passes(ffmpeg: str, encoder: str, vaapi_device=None, vaapi_driver=None) -> bool:
+    """_smoke_test_encoder 가 장치·드라이버 문제로 예외를 내도 "못 쓴다"로 보고 다음 후보로 넘어간다."""
+    try:
+        return _smoke_test_encoder(ffmpeg, encoder, vaapi_device, vaapi_driver)
+    except (OSError, RuntimeError) as exc:
+        log("인코더 시험 실패: %s: %s" % (encoder, type(exc).__name__))
+        return False
 
 
 def hw_decode_for(caps: dict, video_codec, bit_depth=None, hdr: bool = False):
@@ -577,9 +594,14 @@ def _hw_decode_candidates(caps: dict) -> list:
     if system == "Darwin":
         return [("videotoolbox", None, None)]
     if system == "Windows":
-        # d3d11va 는 프레임을 내려받아야 해서 Intel·AMD 내장 GPU 에서 느리다. NVIDIA 만 쓴다.
+        # d3d11va 로 풀어 프레임을 내려받으면 내장 GPU 는 인코더와 GPU 를 나눠 써서 S/W 보다
+        # 느렸다(UHD 630: 1080p 한 편 1.6배, 네 편 1.4~1.8배). Intel 은 QSV 로 디코딩·축소·인코딩을
+        # 모두 GPU 에서 한다 — 그 PC 에서 DXVA2 로 됐을 때 같은 속도 이상에 CPU 1/4~1/8(2026-11-20).
         vendors = _windows_gpu_vendors()
-        return [("cuda", None, None)] if not vendors or "nvidia" in vendors else []
+        found = [("cuda", None, None)] if not vendors or "nvidia" in vendors else []
+        if caps.get("hw_encoder") == "h264_qsv":
+            found.append(("qsv", WINDOWS_QSV_CHILD_DEVICE, None))
+        return found
     if system != "Linux":
         return []
     found = []
@@ -608,8 +630,23 @@ def hw_decode_sample_args(codec: str, depth: int, encoders_out: str, path: str):
     return None
 
 
+def _qsv_input_args(child_device) -> list:
+    """QSV 장치를 그 자식 장치(D3D11·DXVA2) 위에 만들어 디코딩·필터가 같이 쓴다. 프레임은 GPU 에 둔다."""
+    return [
+        "-init_hw_device", "qsv=hw,child_device_type=%s" % (child_device or WINDOWS_QSV_CHILD_DEVICE),
+        "-filter_hw_device", "hw", "-hwaccel", "qsv", "-hwaccel_device", "hw",
+        "-hwaccel_output_format", "qsv",
+    ]
+
+
 def hw_decode_check_args(hwaccel: str, device, depth: int, path: str) -> list:
-    """프레임을 GPU 메모리로 받아 hwdownload 로 내려받는다 — 소프트웨어로 풀었으면 여기서 실패한다."""
+    """프레임을 GPU 메모리로 받아 hwdownload 로 내려받는다 — 소프트웨어로 풀었으면 여기서 실패한다.
+
+    QSV 는 실제 변환처럼 scale_qsv 로 줄이고 8비트로 바꾼 뒤 내려받는다. 디코딩은 되는데 축소
+    출력을 못 만드는 기기(구형 드라이버의 D3D11)를 여기서 거른다."""
+    if hwaccel == "qsv":
+        return ["-v", "error", *_qsv_input_args(device), "-i", path,
+                "-vf", "scale_qsv=w=320:h=180:format=nv12,hwdownload,format=nv12", "-f", "null", "-"]
     args = ["-v", "error"]
     if device:
         args += ["-hwaccel_device", device]
@@ -621,9 +658,11 @@ def hw_decode_check_args(hwaccel: str, device, depth: int, path: str) -> list:
 
 
 def hw_decode_pipeline(caps: dict, hwaccel: str, device) -> str:
-    """VAAPI 는 같은 장치의 VAAPI 인코더가 있으면 GPU 안에서 끝낸다(내려받기는 너무 느리다)."""
+    """VAAPI·QSV 는 같은 계열의 인코더가 있으면 GPU 안에서 끝낸다(내려받기는 너무 느리다)."""
     if hwaccel == "vaapi":
         return "gpu" if caps.get("hw_encoder") == "h264_vaapi" and caps.get("vaapi_device") == device else ""
+    if hwaccel == "qsv":
+        return "gpu" if caps.get("hw_encoder") == "h264_qsv" else ""
     return "download"
 
 
@@ -800,7 +839,9 @@ def probe_hls_fmp4_subtitles(ffmpeg: str, caps: dict, timeout: float = 15.0) -> 
                 output_codec=codec, vaapi_device=caps.get("vaapi_device"),
                 subtitle={"source": "external", "file_path": subtitle},
             )
-            code, output = run_ffmpeg(ffmpeg, args[1:], timeout=timeout, env=encoder_environment(caps))
+            # 실제 작업처럼 출력 폴더에서 돌린다. Windows ffmpeg 는 경로를 '/' 로만 나눠 init.mp4 를
+            # 현재 폴더에 쓴다(실제 작업은 cwd 가 작업 폴더라 문제가 없었다).
+            code, output = run_ffmpeg(ffmpeg, args[1:], timeout=timeout, env=encoder_environment(caps), cwd=out_dir)
             passed = code == 0 and hls_fmp4_subtitle_output_ok(out_dir)
     except Exception as exc:        # 시험 실패는 "못 쓴다"일 뿐이다 — 능력 판정을 멈추지 않는다
         log("fMP4 HLS 자막 시험 실패: %s" % type(exc).__name__)
@@ -812,6 +853,15 @@ def probe_hls_fmp4_subtitles(ffmpeg: str, caps: dict, timeout: float = 15.0) -> 
     return passed
 
 
+def empty_capabilities() -> dict:
+    """아무것도 못 하는 기기의 능력(ffmpeg 를 실행할 수 없을 때)."""
+    return {
+        "video_encoder": None, "hw_encoder": None, "tonemap": False,
+        "vaapi_device": None, "vaapi_driver": None, "ffmpeg_version": "", "hw_decode": None,
+        "video_encoders": {}, "hls_fmp4_subtitles": False,
+    }
+
+
 def detect_capabilities(ffmpeg: str, preference: str = "auto") -> dict:
     """이 ffmpeg 로 쓸 수 있는 인코더를 실측한다.
 
@@ -821,11 +871,7 @@ def detect_capabilities(ffmpeg: str, preference: str = "auto") -> dict:
     H.264 인코더다. video_encoders 는 출력 코덱별 인코더로, "h264" 는 video_encoder 와 같고
     "hevc"·"av1" 은 실측을 통과한 같은 계열의 H/W 인코더가 있을 때만 있다.
     """
-    caps = {
-        "video_encoder": None, "hw_encoder": None, "tonemap": False,
-        "vaapi_device": None, "vaapi_driver": None, "ffmpeg_version": "", "hw_decode": None,
-        "video_encoders": {}, "hls_fmp4_subtitles": False,
-    }
+    caps = empty_capabilities()
     try:
         code, version_out = run_ffmpeg(ffmpeg, ["-version"], timeout=10)
         words = version_out.split()
@@ -847,7 +893,7 @@ def detect_capabilities(ffmpeg: str, preference: str = "auto") -> dict:
             for device, driver in attempts:
                 if time.monotonic() > deadline:
                     break
-                if _smoke_test_encoder(ffmpeg, encoder, device, driver):
+                if _encoder_passes(ffmpeg, encoder, device, driver):
                     caps.update(video_encoder=encoder, hw_encoder=encoder,
                                 vaapi_device=device, vaapi_driver=driver)
                     break
@@ -856,7 +902,7 @@ def detect_capabilities(ffmpeg: str, preference: str = "auto") -> dict:
         for codec, encoder in HW_CODEC_ENCODERS.get(caps["hw_encoder"] or "", {}).items():
             if (" %s " % encoder) not in encoders_out or time.monotonic() > deadline:
                 continue
-            if _smoke_test_encoder(ffmpeg, encoder, caps["vaapi_device"], caps["vaapi_driver"]):
+            if _encoder_passes(ffmpeg, encoder, caps["vaapi_device"], caps["vaapi_driver"]):
                 codec_encoders[codec] = encoder
         if caps["video_encoder"]:
             caps["video_encoders"] = {"h264": caps["video_encoder"], **codec_encoders}
@@ -960,9 +1006,12 @@ def build_transcode_args(
     if mode == MODE_VIDEO and vaapi_encoder and vaapi_device:
         args += ["-vaapi_device", vaapi_device]
     gpu_frames = mode == MODE_VIDEO and bool(hw_decode) and hw_decode.get("pipeline") == "gpu"
-    if mode == MODE_VIDEO and hw_decode:
+    qsv_frames = gpu_frames and hw_decode.get("hwaccel") == "qsv"
+    if mode == MODE_VIDEO and qsv_frames:
+        args += _qsv_input_args(hw_decode.get("device"))
+    elif mode == MODE_VIDEO and hw_decode:
         # "download": 프레임을 내려받아 필터·인코더가 그대로 동작한다.
-        # "gpu"(VAAPI): 프레임을 GPU 에 둔 채 scale_vaapi 로 줄여 같은 장치에서 인코딩한다.
+        # "gpu"(VAAPI·QSV): 프레임을 GPU 에 둔 채 GPU 필터로 줄여 같은 장치에서 인코딩한다.
         if hw_decode.get("device"):
             args += ["-hwaccel_device", hw_decode["device"]]
         args += ["-hwaccel", hw_decode["hwaccel"]]
@@ -976,11 +1025,16 @@ def build_transcode_args(
     if mode == MODE_VIDEO and gpu_frames:
         # 디코딩·축소·인코딩을 모두 GPU 에서 한다. format=nv12 가 10비트를 8비트로 바꾼다.
         scale = "format=nv12"
-        if max_height:
+        if max_height and qsv_frames:
+            # scale_qsv 에는 force_original_aspect_ratio 가 없다 — 비율을 지키는 크기를 식으로 준다.
+            max_width = VIDEO_RESOLUTION_WIDTHS.get(max_height, max_height * 16 // 9)
+            scale = ("w='2*trunc(min(iw,min(%d,%d*iw/ih))/2)':h='2*trunc(min(ih,min(%d,%d*ih/iw))/2)':"
+                     "format=nv12" % (max_width, max_height, max_height, max_width))
+        elif max_height:
             max_width = VIDEO_RESOLUTION_WIDTHS.get(max_height, max_height * 16 // 9)
             scale = ("w='min(iw,%d)':h='min(ih,%d)':"
                      "force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12" % (max_width, max_height))
-        args += ["-vf", "scale_vaapi=" + scale]
+        args += ["-vf", ("scale_qsv=" if qsv_frames else "scale_vaapi=") + scale]
     if mode == MODE_VIDEO:
         filters: list = []
         if max_height and not gpu_frames:

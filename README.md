@@ -208,7 +208,7 @@ python3 ~/shyni-transcoder/agent/shyni_transcode_agent.py remove-server --url ht
 | NVIDIA (Linux, Windows) | NVENC | H.264, H.265, AV1(RTX 40 계열부터) | CUDA | NVIDIA 드라이버 |
 | Intel / AMD (Linux) | VAAPI, QSV | H.264, H.265, AV1(지원하는 GPU) | VAAPI(VAAPI 인코더와 함께일 때) | `/dev/dri` 접근 권한(`render` 그룹), VAAPI 드라이버 |
 | AMD (Windows) | AMF | H.264, H.265, AV1(RX 7000 계열부터) | 없음(CPU) | AMD Adrenalin 드라이버 |
-| Intel (Windows) | QSV | H.264, H.265, AV1(Arc·Core Ultra 부터) | 없음(CPU) | Intel 그래픽 드라이버 |
+| Intel (Windows) | QSV | H.264, H.265, AV1(Arc·Core Ultra 부터) | QSV(D3D11 에서 축소까지 되는 드라이버, 아니면 CPU) | Intel 그래픽 드라이버 |
 
 Windows 에서 외장 그래픽과 내장 그래픽이 같이 있으면 외장(NVIDIA·AMD)을 먼저 시험합니다. 원격 데스크톱
 (RDP)으로 접속한 세션에서는 GPU 를 못 쓸 수 있습니다 — 그때는 기기 앞에서 로그인한 세션에서 돌리세요.
@@ -250,6 +250,13 @@ GPU 디코딩과 CPU 디코딩으로 한 번씩 돌려, CPU 를 확실히 덜 �
 VAAPI 는 프레임을 GPU 에 둔 채 축소·인코딩하고, HDR 원본은 톤매핑 때문에 CPU 로 풉니다. GPU
 디코딩으로 시작한 변환이 첫 출력 전에 실패하면 CPU 디코딩으로 다시 시작합니다. 결과는 `status` 의
 "디코딩" 줄과 서버 관리 화면에 나옵니다. 서버는 원본을 GPU 로 풀 수 있는 러너를 먼저 고릅니다.
+
+Windows 의 Intel 그래픽(0.6.2)은 QSV 로 디코딩·축소·인코딩을 모두 GPU 에서 하되, D3D11 위에서
+축소(`scale_qsv`)까지 되는 드라이버에서만 켭니다. 프레임을 CPU 로 내려받는 방식(d3d11va)은 GPU 를
+인코더와 나눠 써서 CPU 디코딩보다 느려 쓰지 않습니다. 8세대(UHD 630) 구형 드라이버는 D3D11 축소가
+안 되어 CPU 로 풉니다 — 그 PC 에서는 CPU 디코딩이 가장 빨랐습니다. DXVA2 위에서는 축소가 되지만
+모니터가 꺼지면 장치를 못 만들어 쓰지 않습니다. GPU 디코딩이 실제로 켜지는 Intel 기기에서는
+아직 시험하지 못했습니다.
 
 ## 쓰기
 
@@ -353,11 +360,13 @@ Windows(PowerShell)는 `python3` 대신 `py`, 경로는 `"$HOME\shyni-transcoder
 python3 -m unittest discover -s . -p 'test_*.py'
 ```
 
-ffmpeg 명령 구성(`build_*_args`, 인코더 실측)은 Shyni 서버가 직접 변환할 때와 같은 결과를
-내야 합니다. 같은 원본이 서버에서 변환되든 러너에서 변환되든 재생기가 받는 스트림이 같아야
-하기 때문입니다. 서버 쪽에 두 구현을 맞대는 테스트가 있으므로, 명령 구성을 바꿀 때는 서버와
-함께 바꿉니다. 서버와 에이전트의 약속은 `PROTOCOL_VERSION` 하나이고, 서로 호환되지 않게
-바뀌면 이 번호를 올립니다.
+Shyni 서버도 이 파일을 그대로 불러 ffmpeg 명령 구성(`build_*_args`), 인코더·디코더 실측,
+비트레이트·오디오 규칙에 씁니다. 같은 원본이 서버에서 변환되든 러너에서 변환되든 재생기가 받는
+스트림이 같도록 구현을 한 벌만 둡니다. 원본은 Shyni 저장소의 `server/app/services/` 에 있고
+(`tools/transcode-agent/` 의 파일은 그것을 가리키는 링크), 이 저장소에는 그 파일을 그대로
+올립니다. 그래서 명령 구성 부분은 서버의 Python 3.12 에서도 돌아야 하고, 표준 라이브러리만
+씁니다. 서버와 에이전트의 약속은 `PROTOCOL_VERSION` 하나이고, 서로 호환되지 않게 바뀌면 이 번호를
+올립니다.
 
 ## 라이선스
 
